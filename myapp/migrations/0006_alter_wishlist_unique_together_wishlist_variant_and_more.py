@@ -33,12 +33,12 @@ class Migration(migrations.Migration):
                 to="myapp.productvariantsize",
             ),
         ),
-        migrations.RemoveField(
-            model_name="wishlist",
-            name="product",
-        ),
         migrations.AlterUniqueTogether(
             name="wishlist",
             unique_together={("user", "variant_size")},
+        ),
+        migrations.RemoveField(
+            model_name="wishlist",
+            name="product",
         ),
     ]
