@@ -12,3 +12,8 @@ staticfiles/
 .vscode/
 .idea/ 
 
+# Dummy Data and Media
+populate.py
+uploads/
+data.json
+category.json

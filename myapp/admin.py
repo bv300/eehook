@@ -2,9 +2,9 @@ import nested_admin
 from django.contrib import admin
 from .models import *
 
-admin.site.site_header = "Amora Admin"
-admin.site.site_title = "Amora"
-admin.site.index_title = "Welcome To Amora Dashboard"
+admin.site.site_header = "eehook Admin"
+admin.site.site_title = "eehook"
+admin.site.index_title = "Welcome To eehook Admin Dashboard"
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
