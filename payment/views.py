@@ -20,7 +20,7 @@ from myapp.models import (
     Address,
     Order,
     OrderItem,
-    ProductVariantSize,
+    ProductVariantUnit,
 )
 
 from myapp.utils import (
@@ -82,8 +82,8 @@ def create_checkout_session(request):
             "variant__product",
             "variant__product__offer",
             "variant__color",
-            "variant_size",
-            "variant_size__size",
+            "variant_unit",
+            "variant_unit__unit",
         )
     )
 
@@ -110,20 +110,20 @@ def create_checkout_session(request):
 
     for item in cart_items:
 
-        if item.quantity > item.variant_size.stock:
+        if item.quantity > item.variant_unit.stock:
 
             return Response(
                 {
                     "message":
                     f"{item.variant.product.name} has only "
-                    f"{item.variant_size.stock} item(s) left."
+                    f"{item.variant_unit.stock} item(s) left."
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
 
 
         original_price = Decimal(
-            str(item.variant_size.price)
+            str(item.variant_unit.price)
         )
 
 
@@ -167,7 +167,7 @@ def create_checkout_session(request):
                         # after payment, without creating a Pending Order.
                         "metadata": {
                             "type": "product",
-                            "variant_size_id": str(item.variant_size_id),
+                            "variant_unit_id": str(item.variant_unit_id),
                             "original_price": str(original_price),
                             "discount_amount": str(discount_amount),
                             "discounted_price": str(discounted_price),
@@ -404,14 +404,14 @@ def fulfill_paid_order(session):
             )
 
 
-        variant_size_id = metadata.get(
-            "variant_size_id"
+        variant_unit_id = metadata.get(
+            "variant_unit_id"
         )
 
-        if not variant_size_id:
+        if not variant_unit_id:
 
             raise ValueError(
-                "Variant size missing from Stripe line item"
+                "Variant unit missing from Stripe line item"
             )
 
 
@@ -426,7 +426,7 @@ def fulfill_paid_order(session):
 
         product_snapshots.append(
             {
-                "variant_size_id": int(variant_size_id),
+                "variant_unit_id": int(variant_unit_id),
                 "quantity": quantity,
                 "original_price": Decimal(
                     metadata.get("original_price", "0")
@@ -517,21 +517,21 @@ def fulfill_paid_order(session):
     # =====================================================
 
     variant_size_ids = [
-        snapshot["variant_size_id"]
+        snapshot["variant_unit_id"]
         for snapshot in product_snapshots
     ]
 
 
     locked_sizes = {
-        variant_size.id: variant_size
-        for variant_size in (
-            ProductVariantSize.objects
+        variant_unit.id: variant_unit
+        for variant_unit in (
+            ProductVariantUnit.objects
             .select_for_update()
             .select_related(
                 "variant",
                 "variant__product",
                 "variant__color",
-                "size",
+                "unit",
             )
             .filter(
                 id__in=variant_size_ids
@@ -546,22 +546,22 @@ def fulfill_paid_order(session):
 
     for snapshot in product_snapshots:
 
-        variant_size = locked_sizes.get(
-            snapshot["variant_size_id"]
+        variant_unit = locked_sizes.get(
+            snapshot["variant_unit_id"]
         )
 
-        if not variant_size:
+        if not variant_unit:
 
             raise ValueError(
                 "Product variant not found"
             )
 
 
-        if variant_size.stock < snapshot["quantity"]:
+        if variant_unit.stock < snapshot["quantity"]:
 
             raise ValueError(
                 f"Insufficient stock for "
-                f"{variant_size.variant.product.name}"
+                f"{variant_unit.variant.product.name}"
             )
 
 
@@ -600,21 +600,21 @@ def fulfill_paid_order(session):
 
     for snapshot in product_snapshots:
 
-        variant_size = locked_sizes[
-            snapshot["variant_size_id"]
+        variant_unit = locked_sizes[
+            snapshot["variant_unit_id"]
         ]
 
         OrderItem.objects.create(
 
             order=order,
 
-            product=variant_size.variant.product,
+            product=variant_unit.variant.product,
 
-            color=variant_size.variant.color,
+            color=variant_unit.variant.color,
 
-            size=variant_size.size,
+            unit=variant_unit.unit,
 
-            variant_size=variant_size,
+            variant_unit=variant_unit,
 
             quantity=snapshot["quantity"],
 
@@ -638,13 +638,13 @@ def fulfill_paid_order(session):
 
     for snapshot in product_snapshots:
 
-        variant_size = locked_sizes[
-            snapshot["variant_size_id"]
+        variant_unit = locked_sizes[
+            snapshot["variant_unit_id"]
         ]
 
-        variant_size.stock -= snapshot["quantity"]
+        variant_unit.stock -= snapshot["quantity"]
 
-        variant_size.save(
+        variant_unit.save(
             update_fields=[
                 "stock"
             ]
@@ -659,7 +659,7 @@ def fulfill_paid_order(session):
 
         Cart.objects.filter(
             user_id=user_id,
-            variant_size_id=snapshot["variant_size_id"],
+            variant_unit_id=snapshot["variant_unit_id"],
         ).delete()
 
 

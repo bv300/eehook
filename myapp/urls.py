@@ -3,6 +3,7 @@ from .import views
 from rest_framework_simplejwt.views import TokenRefreshView
 
 urlpatterns = [
+    path("health/", views.health_check),
     path("register/",views.register),
     path("token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     path("google-login/", views.google_login),
@@ -84,5 +85,15 @@ path(
 path(
         "hero-banners/",
         views.get_hero_banners
+    ),
+    path(
+        "api/promo-banners/",
+        views.get_promo_banners,
+        name="promo-banners"
+    ),
+    path(
+        "api/hero-side-banner/",
+        views.get_hero_side_banner,
+        name="hero-side-banner"
     )
-]   
+]

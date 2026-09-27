@@ -165,21 +165,33 @@ class ColorSerializer(serializers.ModelSerializer):
 
 
 
-class SizeSerializer(serializers.ModelSerializer):
+class UnitSerializer(serializers.ModelSerializer):
+
+    unit_type = serializers.CharField(source="unit_type.name", read_only=True)
 
     class Meta:
-        model = Size
+        model = Unit
 
+        fields = [
+            "id",
+            "name",
+            "unit_type"
+        ]
+
+class RegionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Region
         fields = [
             "id",
             "name"
         ]
         
-class ProductVariantSizeSerializer(
+class ProductVariantUnitSerializer(
     serializers.ModelSerializer
 ):
 
-    size = SizeSerializer(
+    size = UnitSerializer(
+        source="unit",
         read_only=True
     )
 
@@ -193,7 +205,7 @@ class ProductVariantSizeSerializer(
 
     class Meta:
 
-        model = ProductVariantSize
+        model = ProductVariantUnit
 
         fields = [
             "id",
@@ -254,7 +266,12 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         read_only=True
     )
 
-    sizes = ProductVariantSizeSerializer(
+    regions = RegionSerializer(
+        many=True,
+        read_only=True
+    )
+
+    sizes = ProductVariantUnitSerializer(
         many=True,
         read_only=True
     )
@@ -271,6 +288,7 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "color",
+            "regions",
             "sizes",
             "images"
         ]
@@ -289,7 +307,7 @@ class CartSerializer(serializers.ModelSerializer):
     )
 
     variant_size = serializers.IntegerField(
-        source="variant_size.id",
+        source="variant_unit.id",
         read_only=True
     )
 
@@ -306,18 +324,23 @@ class CartSerializer(serializers.ModelSerializer):
     )
 
     size = serializers.CharField(
-        source="variant_size.size.name",
+        source="variant_unit.unit.name",
+        read_only=True
+    )
+
+    unit_type = serializers.CharField(
+        source="variant_unit.unit.unit_type.name",
         read_only=True
     )
 
     original_price = serializers.DecimalField(
-        source="variant_size.price",
+        source="variant_unit.price",
         max_digits=10,
         decimal_places=2,
         read_only=True
     )
     stock = serializers.IntegerField(
-        source="variant_size.stock",
+        source="variant_unit.stock",
         read_only=True
     )
 
@@ -348,6 +371,7 @@ class CartSerializer(serializers.ModelSerializer):
             "product_image",
             "color",
             "size",
+            "unit_type",
             "original_price",
             "discounted_price",
             "discount_amount",
@@ -384,7 +408,7 @@ class CartSerializer(serializers.ModelSerializer):
     ):
 
         return calculate_offer_price(
-            obj.variant_size.price,
+            obj.variant_unit.price,
             obj.variant.product.offer
         )
 
@@ -394,7 +418,7 @@ class CartSerializer(serializers.ModelSerializer):
     ):
 
         return calculate_discount_amount(
-            obj.variant_size.price,
+            obj.variant_unit.price,
             obj.variant.product.offer
         )
 
@@ -426,7 +450,7 @@ class CartSerializer(serializers.ModelSerializer):
     ):
 
         discounted_price = calculate_offer_price(
-            obj.variant_size.price,
+            obj.variant_unit.price,
             obj.variant.product.offer
         )
 
@@ -533,7 +557,12 @@ class OrderItemSerializer(
     )
 
     size = serializers.CharField(
-        source="size.name",
+        source="unit.name",
+        read_only=True
+    )
+
+    unit_type = serializers.CharField(
+        source="unit.unit_type.name",
         read_only=True
     )
 
@@ -554,6 +583,8 @@ class OrderItemSerializer(
             "color",
 
             "size",
+
+            "unit_type",
 
             "quantity",
 
@@ -761,7 +792,7 @@ class WishlistSerializer(serializers.ModelSerializer):
     )
 
     variant_size = serializers.IntegerField(
-        source="variant_size.id",
+        source="variant_unit.id",
         read_only=True
     )
 
@@ -781,19 +812,24 @@ class WishlistSerializer(serializers.ModelSerializer):
     )
 
     size = serializers.CharField(
-        source="variant_size.size.name",
+        source="variant_unit.unit.name",
+        read_only=True
+    )
+
+    unit_type = serializers.CharField(
+        source="variant_unit.unit.unit_type.name",
         read_only=True
     )
 
     stock = serializers.IntegerField(
-        source="variant_size.stock",
+        source="variant_unit.stock",
         read_only=True
     )
 
     product_image = serializers.SerializerMethodField()
 
     original_price = serializers.DecimalField(
-        source="variant_size.price",
+        source="variant_unit.price",
         max_digits=10,
         decimal_places=2,
         read_only=True
@@ -820,6 +856,7 @@ class WishlistSerializer(serializers.ModelSerializer):
             "category",
             "color",
             "size",
+            "unit_type",
             "stock",
             "product_image",
             "original_price",
@@ -846,21 +883,21 @@ class WishlistSerializer(serializers.ModelSerializer):
 
     def get_discounted_price(self, obj):
 
-        if not obj.variant or not obj.variant_size:
+        if not obj.variant or not obj.variant_unit:
             return None
 
         return calculate_offer_price(
-            obj.variant_size.price,
+            obj.variant_unit.price,
             obj.variant.product.offer
         )
 
     def get_discount_amount(self, obj):
 
-        if not obj.variant or not obj.variant_size:
+        if not obj.variant or not obj.variant_unit:
             return 0
 
         return calculate_discount_amount(
-            obj.variant_size.price,
+            obj.variant_unit.price,
             obj.variant.product.offer
         )
 
@@ -914,6 +951,8 @@ class ProductSerializer(serializers.ModelSerializer):
 
     discount_percentage = serializers.SerializerMethodField()
 
+    key_features = serializers.SerializerMethodField()
+
     class Meta:
 
         model = Product
@@ -933,6 +972,16 @@ class ProductSerializer(serializers.ModelSerializer):
             "discount_percentage",
             "is_active",
             "created_at",
+            "key_features",
+            "shipping_fee",
+            "estimated_delivery_time",
+            "seller_name",
+            "warranty_info",
+            "emi_available",
+            "emi_starting_price",
+            "current_viewers_count",
+            "promotional_banner_url",
+            "promotional_banner_link",
         ]
 
     def get_starting_price(
@@ -979,6 +1028,22 @@ class ProductSerializer(serializers.ModelSerializer):
         return get_product_prices(
             obj
         )["discount_percentage"]
+
+    def get_key_features(self, obj):
+        if obj.key_features:
+            if isinstance(obj.key_features, list):
+                return obj.key_features
+            elif isinstance(obj.key_features, str):
+                try:
+                    import json
+                    parsed = json.loads(obj.key_features)
+                    if isinstance(parsed, list):
+                        return parsed
+                except Exception:
+                    pass
+                return [feature.strip() for feature in obj.key_features.split('\n') if feature.strip()]
+        return []
+
 
 
 class WishlistProductSerializer(
@@ -1042,4 +1107,14 @@ class HeroBannerSerializer( serializers.ModelSerializer):
     class Meta:
 
         model = HeroBanner
+        fields = "__all__"
+
+class PromoBannerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = PromoBanner
+        fields = "__all__"
+
+class HeroSideBannerSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = HeroSideBanner
         fields = "__all__"

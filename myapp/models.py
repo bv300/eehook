@@ -89,14 +89,31 @@ class Color(models.Model):
     def __str__(self):
         return self.name
     
-class Size(models.Model):
+class UnitType(models.Model):
 
+    name = models.CharField(max_length=50, unique=True, help_text="e.g. Weight (kg), Clothing Unit (S/M/L), Memory (GB)")
+
+    def __str__(self):
+        return self.name
+
+class Unit(models.Model):
+
+    unit_type = models.ForeignKey(UnitType, on_delete=models.CASCADE, null=True, blank=True, related_name="units")
     name = models.CharField( max_length=20, unique=True)
     order = models.PositiveIntegerField(default=0)
 
     class Meta:
         ordering = ["order"]
         
+    def __str__(self):
+        if self.unit_type:
+            return f"{self.name} ({self.unit_type.name})"
+        return self.name
+
+class Region(models.Model):
+
+    name = models.CharField(max_length=50, unique=True)
+
     def __str__(self):
         return self.name
 
@@ -110,13 +127,47 @@ class Product(models.Model):
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField( auto_now_add=True )
     updated_at = models.DateTimeField( auto_now=True )
+    key_features = models.TextField(blank=True, help_text="Enter key features separated by newlines")
+    shipping_fee = models.DecimalField(max_digits=10, decimal_places=2, default=0.00)
+    estimated_delivery_time = models.CharField(max_length=100, blank=True, null=True)
+    seller_name = models.CharField(max_length=200, blank=True, null=True)
+    warranty_info = models.CharField(max_length=200, blank=True, null=True)
+    emi_available = models.BooleanField(default=False)
+    emi_starting_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    current_viewers_count = models.PositiveIntegerField(default=0)
+    promotional_banner_url = models.URLField(max_length=500, blank=True, null=True)
+    promotional_banner_link = models.URLField(max_length=500, blank=True, null=True)
 
     def __str__(self):
         return self.name
 
+    def clean(self):
+        super().clean()
+        from django.core.exceptions import ValidationError
+        from django.db.models import Min
+        if self.emi_starting_price is not None:
+            if self.pk:
+                min_price = ProductVariantUnit.objects.filter(variant__product=self).aggregate(Min('price'))['price__min']
+                if min_price is not None and self.emi_starting_price > min_price:
+                    raise ValidationError({'emi_starting_price': 'EMI starting price cannot be greater than the product price.'})
+
+class ProductView(models.Model):
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="unique_views")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, null=True, blank=True)
+    ip_address = models.CharField(max_length=45, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['product', 'user']),
+            models.Index(fields=['product', 'ip_address']),
+        ]
+
+
 class ProductVariant(models.Model):
     product = models.ForeignKey( Product, on_delete=models.CASCADE, related_name="variants" )
     color = models.ForeignKey(Color,on_delete=models.CASCADE, null=True, blank=True )
+    regions = models.ManyToManyField(Region, blank=True)
 
     class Meta:
         unique_together = (
@@ -124,30 +175,35 @@ class ProductVariant(models.Model):
             "color"
         )
     def __str__(self):
+        parts = [self.product.name]
         if self.color:
-            return (
-                f"{self.product.name} - "
-                f"{self.color.name}"
-            )
-        return self.product.name
+            parts.append(self.color.name)
+        if self.pk:
+            try:
+                region_names = [r.name for r in self.regions.all()]
+                if region_names:
+                    parts.append(", ".join(region_names))
+            except ValueError:
+                pass
+        return " - ".join(parts)
 
-class ProductVariantSize(models.Model):
+class ProductVariantUnit(models.Model):
 
     variant = models.ForeignKey(ProductVariant,on_delete=models.CASCADE, related_name="sizes" )
-    size = models.ForeignKey( Size,  on_delete=models.CASCADE, null=True, blank=True )
+    unit = models.ForeignKey( Unit,  on_delete=models.CASCADE, null=True, blank=True )
     price = models.DecimalField( max_digits=10,decimal_places=2)
     stock = models.PositiveIntegerField( default=0)
 
     class Meta:
         unique_together = (
             "variant",
-            "size"
+            "unit"
         )
     def __str__(self):
-        if self.size:
+        if self.unit:
             return (
                 f"{self.variant} - "
-                f"{self.size.name}"
+                f"{self.unit.name}"
             )
 
         return str(self.variant)
@@ -179,8 +235,8 @@ class Wishlist(models.Model):
     blank=True
     )
 
-    variant_size = models.ForeignKey(
-    ProductVariantSize,
+    variant_unit = models.ForeignKey(
+    ProductVariantUnit,
     on_delete=models.CASCADE,
     related_name="wishlist",
     null=True,
@@ -194,7 +250,7 @@ class Wishlist(models.Model):
     class Meta:
         unique_together = (
             "user",
-            "variant_size"
+            "variant_unit"
         )
 
     def __str__(self):
@@ -205,9 +261,9 @@ class Wishlist(models.Model):
             else ""
         )
 
-        size = (
-            self.variant_size.size.name
-            if self.variant_size.size
+        unit = (
+            self.variant_unit.unit.name
+            if self.variant_unit.unit
             else ""
         )
 
@@ -215,21 +271,21 @@ class Wishlist(models.Model):
             f"{self.user.email} - "
             f"{self.variant.product.name} - "
             f"{color} - "
-            f"{size}"
+            f"{unit}"
         )
         
 class Cart(models.Model):
 
     user = models.ForeignKey( User, on_delete=models.CASCADE )
     variant = models.ForeignKey( ProductVariant, on_delete=models.CASCADE )
-    variant_size = models.ForeignKey( ProductVariantSize,on_delete=models.CASCADE)
+    variant_unit = models.ForeignKey( ProductVariantUnit,on_delete=models.CASCADE)
     quantity = models.PositiveIntegerField( default=1)
     created_at = models.DateTimeField( auto_now_add=True )
 
     class Meta:
         unique_together = (
             "user",
-            "variant_size"
+            "variant_unit"
         )
 
     def __str__(self):
@@ -237,7 +293,7 @@ class Cart(models.Model):
             f"{self.user.email} - "
             f"{self.variant.product.name} - "
             f"{self.variant.color.name} - "
-            f"{self.variant_size.size.name}"
+            f"{self.variant_unit.unit.name}"
         )
 
 class Address(models.Model):
@@ -372,8 +428,8 @@ class OrderItem(models.Model):
     )
     
 
-    size = models.ForeignKey(
-        Size,
+    unit = models.ForeignKey(
+        Unit,
         on_delete=models.SET_NULL,
         null=True
     )
@@ -386,8 +442,8 @@ class OrderItem(models.Model):
         default=0
     )
     
-    variant_size = models.ForeignKey(
-        ProductVariantSize,
+    variant_unit = models.ForeignKey(
+        ProductVariantUnit,
         on_delete=models.SET_NULL,
         null=True,
         blank=True
@@ -443,3 +499,21 @@ class HeroBanner(models.Model):
 
     def __str__(self):
         return self.title
+
+class PromoBanner(models.Model):
+
+    image = models.ImageField(upload_to="promo_banners/", help_text='The promotional banner image', null=True, blank=True)
+    link = models.URLField(max_length=500, blank=True, null=True, help_text='A URL where the user should be redirected if they click the banner')
+    is_active = models.BooleanField(default=True, help_text='To easily turn individual banners on or off')
+
+    def __str__(self):
+        return f"Promo Banner {self.id}"
+
+class HeroSideBanner(models.Model):
+
+    image = models.ImageField(upload_to="hero_side_banners/", help_text='The actual image file')
+    link = models.URLField(max_length=500, blank=True, null=True, help_text='A URL where the user should be redirected if they click the banner')
+    is_active = models.BooleanField(default=True, help_text='Only one banner should be active at a time')
+
+    def __str__(self):
+        return f"Hero Side Banner {self.id}"

@@ -10,8 +10,12 @@ from django.utils.encoding import force_bytes
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
-from django.http import HttpResponse
+from django.http import HttpResponse, JsonResponse
 from rest_framework_simplejwt.tokens import RefreshToken
+
+@api_view(["GET"])
+def health_check(request):
+    return JsonResponse({"status": "ok", "message": "API is healthy"})
 
 from .serializers import *
 
@@ -305,6 +309,45 @@ def product_details( request,pk): #PRODUCT DETAIL PAGE IL SIZE UM COLOR SELET CH
             id=pk,
             is_active=True
         )
+        
+        # Track unique view only if not a bot
+        from .models import ProductView
+        from django.db.models import F
+        
+        user_agent = request.META.get('HTTP_USER_AGENT', '').lower()
+        bot_keywords = [
+            'bot', 'crawl', 'spider', 'slurp', 'mediapartners', 'whatsapp', 
+            'facebook', 'twitter', 'discord', 'telegram', 'chatgpt', 
+            'openai', 'claude', 'gemini', 'anthropic'
+        ]
+        is_bot = any(keyword in user_agent for keyword in bot_keywords)
+        
+        if not is_bot:
+            has_viewed = False
+            
+            # Check if user is authenticated
+            if request.user and request.user.is_authenticated:
+                # Check if this user already viewed
+                has_viewed = ProductView.objects.filter(product=product, user=request.user).exists()
+                if not has_viewed:
+                    ProductView.objects.create(product=product, user=request.user)
+            else:
+                # Get IP address
+                x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
+                if x_forwarded_for:
+                    ip = x_forwarded_for.split(',')[0]
+                else:
+                    ip = request.META.get('REMOTE_ADDR')
+                    
+                if ip:
+                    has_viewed = ProductView.objects.filter(product=product, ip_address=ip).exists()
+                    if not has_viewed:
+                        ProductView.objects.create(product=product, ip_address=ip)
+            
+            if not has_viewed:
+                product.current_viewers_count = F('current_viewers_count') + 1
+                product.save(update_fields=['current_viewers_count'])
+                product.refresh_from_db()
 
     except Product.DoesNotExist:
 
@@ -399,13 +442,13 @@ def add_to_wishlist(request):
     user = request.user
 
     variant_id = request.data.get("variant")
-    variant_size_id = request.data.get("variant_size")
+    variant_unit_id = request.data.get("variant_size")
 
-    if not variant_id or not variant_size_id:
+    if not variant_id or not variant_unit_id:
 
         return Response(
             {
-                "error": "Variant and variant size are required"
+                "error": "Variant and variant unit are required"
             },
             status=400
         )
@@ -427,16 +470,16 @@ def add_to_wishlist(request):
 
     try:
 
-        variant_size = ProductVariantSize.objects.get(
-            id=variant_size_id,
+        variant_unit = ProductVariantUnit.objects.get(
+            id=variant_unit_id,
             variant=variant
         )
 
-    except ProductVariantSize.DoesNotExist:
+    except ProductVariantUnit.DoesNotExist:
 
         return Response(
             {
-                "error": "Variant size not found"
+                "error": "Variant unit not found"
             },
             status=404
         )
@@ -445,7 +488,7 @@ def add_to_wishlist(request):
 
         user=user,
         variant=variant,
-        variant_size=variant_size
+        variant_unit=variant_unit
 
     )
 
@@ -474,8 +517,8 @@ def get_wishlist(request):
         "variant",
         "variant__product",
         "variant__color",
-        "variant_size",
-        "variant_size__size",
+        "variant_unit",
+        "variant_unit__unit",
         "variant__product__category",
         "variant__product__offer"
     )
@@ -515,7 +558,7 @@ def add_to_cart(request):
         "variant"
     )
 
-    variant_size_id = request.data.get(
+    variant_unit_id = request.data.get(
         "variant_size"
     )
 
@@ -556,10 +599,10 @@ def add_to_cart(request):
             id=variant_id
         )
 
-        variant_size = ProductVariantSize.objects.select_related(
+        variant_unit = ProductVariantUnit.objects.select_related(
             "variant"
         ).get(
-            id=variant_size_id
+            id=variant_unit_id
         )
 
     except ProductVariant.DoesNotExist:
@@ -572,32 +615,32 @@ def add_to_cart(request):
             status=status.HTTP_404_NOT_FOUND
         )
 
-    except ProductVariantSize.DoesNotExist:
+    except ProductVariantUnit.DoesNotExist:
 
         return Response(
             {
                 "message":
-                "Variant size not found"
+                "Variant unit not found"
             },
             status=status.HTTP_404_NOT_FOUND
         )
 
-    if variant_size.variant != variant:
+    if variant_unit.variant != variant:
 
         return Response(
             {
                 "message":
-                "Invalid size selected"
+                "Invalid unit selected"
             },
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    if quantity > variant_size.stock:
+    if quantity > variant_unit.stock:
 
         return Response(
             {
                 "message":
-                f"Only {variant_size.stock} items available in stock"
+                f"Only {variant_unit.stock} items available in stock"
             },
             status=status.HTTP_400_BAD_REQUEST
         )
@@ -608,7 +651,7 @@ def add_to_cart(request):
 
         variant=variant,
 
-        variant_size=variant_size,
+        variant_unit=variant_unit,
 
         defaults={
             "quantity": quantity
@@ -620,12 +663,12 @@ def add_to_cart(request):
 
         new_quantity = cart_item.quantity + quantity
 
-        if new_quantity > variant_size.stock:
+        if new_quantity > variant_unit.stock:
 
             return Response(
                 {
                     "message":
-                    f"Only {variant_size.stock} items available in stock"
+                    f"Only {variant_unit.stock} items available in stock"
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
@@ -657,8 +700,8 @@ def get_cart(request):
             "variant__product",
             "variant__product__offer",
             "variant__color",
-            "variant_size",
-            "variant_size__size",
+            "variant_unit",
+            "variant_unit__unit",
         )
         .prefetch_related(
             "variant__images"
@@ -677,7 +720,7 @@ def get_cart(request):
     for item in cart:
 
         discounted_price = calculate_offer_price(
-            item.variant_size.price,
+            item.variant_unit.price,
             item.variant.product.offer
         )
 
@@ -709,7 +752,7 @@ def update_cart_quantity(request, id):
     try:
 
         cart = Cart.objects.select_related(
-            "variant_size"
+            "variant_unit"
         ).get(
             id=id,
             user=request.user
@@ -753,12 +796,12 @@ def update_cart_quantity(request, id):
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    if quantity > cart.variant_size.stock:
+    if quantity > cart.variant_unit.stock:
 
         return Response(
             {
                 "message":
-                f"Only {cart.variant_size.stock} items available in stock"
+                f"Only {cart.variant_unit.stock} items available in stock"
             },
             status=status.HTTP_400_BAD_REQUEST
         )
@@ -768,7 +811,7 @@ def update_cart_quantity(request, id):
     cart.save()
 
     discounted_price = calculate_offer_price(
-        cart.variant_size.price,
+        cart.variant_unit.price,
         cart.variant.product.offer
     )
 
@@ -782,7 +825,7 @@ def update_cart_quantity(request, id):
         .filter(user=request.user)
         .select_related(
             "variant__product__offer",
-            "variant_size"
+            "variant_unit"
         )
     )
 
@@ -794,7 +837,7 @@ def update_cart_quantity(request, id):
 
         subtotal += (
             calculate_offer_price(
-                item.variant_size.price,
+                item.variant_unit.price,
                 item.variant.product.offer
             )
             *
@@ -866,7 +909,7 @@ def place_order(request):
         .select_related(
             "variant__product__offer",
             "variant__color",
-            "variant_size__size"
+            "variant_unit__unit"
         )
         .filter(
             user=request.user
@@ -891,17 +934,17 @@ def place_order(request):
 
     for item in cart_items:
 
-        if item.quantity > item.variant_size.stock:
+        if item.quantity > item.variant_unit.stock:
 
             return Response(
                 {
                     "message":
-                    f"Only {item.variant_size.stock} items available for {item.variant.product.name}"
+                    f"Only {item.variant_unit.stock} items available for {item.variant.product.name}"
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        original_price = item.variant_size.price
+        original_price = item.variant_unit.price
 
         discounted_price = calculate_offer_price(
             original_price,
@@ -953,7 +996,7 @@ def place_order(request):
     
     for item in cart_items:
 
-        original_price = item.variant_size.price
+        original_price = item.variant_unit.price
 
         discounted_price = calculate_offer_price(
             original_price,
@@ -973,7 +1016,7 @@ def place_order(request):
 
             color=item.variant.color,
 
-            size=item.variant_size.size,
+            unit=item.variant_unit.unit,
 
             quantity=item.quantity,
 
@@ -990,9 +1033,9 @@ def place_order(request):
 
         )
 
-        item.variant_size.stock -= item.quantity
+        item.variant_unit.stock -= item.quantity
 
-        item.variant_size.save()
+        item.variant_unit.save()
 
     cart_items.delete()
 
@@ -1335,7 +1378,7 @@ from django.db import transaction
 #     cart_items = Cart.objects.select_related(
 #         "variant__product__offer",
 #         "variant__color",
-#         "variant_size__size",
+#         "variant_unit__unit",
 #     ).filter(
 #         user=request.user
 #     )
@@ -1353,13 +1396,13 @@ from django.db import transaction
 
 #     for item in cart_items:
 
-#         if item.quantity > item.variant_size.stock:
+#         if item.quantity > item.variant_unit.stock:
 
 #             return Response(
 #                 {
 #                     "message": (
 #                         f"Only "
-#                         f"{item.variant_size.stock} "
+#                         f"{item.variant_unit.stock} "
 #                         f"items available for "
 #                         f"{item.variant.product.name}"
 #                     )
@@ -1368,7 +1411,7 @@ from django.db import transaction
 #             )
 
 #         discounted_price = calculate_offer_price(
-#             item.variant_size.price,
+#             item.variant_unit.price,
 #             item.variant.product.offer
 #         )
 
@@ -1405,7 +1448,7 @@ from django.db import transaction
 
 #         prices = get_product_prices(
 
-#             item.variant_size.price,
+#             item.variant_unit.price,
 
 #             item.variant.product.offer,
 
@@ -1421,9 +1464,9 @@ from django.db import transaction
 
 #             color=item.variant.color,
 
-#             size=item.variant_size.size,
+#             unit=item.variant_unit.unit,
 
-#             variant_size=item.variant_size,
+#             variant_unit=item.variant_unit,
 
 #             quantity=item.quantity,
 
@@ -1437,9 +1480,9 @@ from django.db import transaction
 
 #         )
 
-#         item.variant_size.stock -= item.quantity
+#         item.variant_unit.stock -= item.quantity
 
-#         item.variant_size.save()
+#         item.variant_unit.save()
 
 #     cart_items.delete()
 
@@ -1530,9 +1573,9 @@ def cancel_order(request, id):
 
     for item in order.items.all():
 
-        item.variant_size.stock += item.quantity
+        item.variant_unit.stock += item.quantity
 
-        item.variant_size.save()
+        item.variant_unit.save()
 
     order.status = "Cancelled"
 
@@ -1861,11 +1904,11 @@ def low_stock_products(request):
             status=403
         )
 
-    products = ProductVariantSize.objects.select_related(
+    products = ProductVariantUnit.objects.select_related(
         "variant__product",
         "variant__color",
         "variant__product__category",
-        "size"
+        "unit"
     ).filter(
         stock__lte=5
     ).order_by(
@@ -1894,9 +1937,9 @@ def low_stock_products(request):
                 else None
             ),
 
-            "size": (
-                item.size.name
-                if item.size
+            "unit": (
+                item.unit.name
+                if item.unit
                 else None
             ),
 
@@ -2326,3 +2369,17 @@ def get_hero_banners(request):
     return Response(
         serializer.data
     )
+
+@api_view(["GET"])
+def get_promo_banners(request):
+    banners = PromoBanner.objects.filter(is_active=True)
+    serializer = PromoBannerSerializer(banners, many=True)
+    return Response(serializer.data)
+
+@api_view(["GET"])
+def get_hero_side_banner(request):
+    banner = HeroSideBanner.objects.filter(is_active=True).first()
+    if banner:
+        serializer = HeroSideBannerSerializer(banner)
+        return Response(serializer.data)
+    return Response({})
