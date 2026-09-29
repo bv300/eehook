@@ -603,11 +603,22 @@ def add_to_cart(request):
     except ProductVariantUnit.DoesNotExist:
         return Response({"message": "Variant unit not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    if variant_unit and variant_unit.variant != variant:
+    if not variant_unit:
+        # For both single and multiple price types, a ProductVariantUnit is required to track stock.
+        # If it's missing, treat it as out of stock.
+        return Response({"message": "Out of stock"}, status=status.HTTP_400_BAD_REQUEST)
+
+    if variant_unit.variant != variant:
         return Response({"message": "Invalid unit selected"}, status=status.HTTP_400_BAD_REQUEST)
 
-    if variant_unit and quantity > variant_unit.stock:
+    if quantity > variant_unit.stock:
         return Response({"message": f"Only {variant_unit.stock} items available in stock"}, status=status.HTTP_400_BAD_REQUEST)
+
+    saved_coupon = SavedCoupon.objects.filter(user=request.user, product=variant.product).first()
+    coupon = saved_coupon.coupon if saved_coupon and saved_coupon.coupon.is_valid else None
+
+    if coupon and CouponUsage.objects.filter(coupon=coupon, user=request.user).exists():
+        coupon = None
 
     cart_item, created = Cart.objects.get_or_create(
 
@@ -618,7 +629,8 @@ def add_to_cart(request):
         variant_unit=variant_unit,
 
         defaults={
-            "quantity": quantity
+            "quantity": quantity,
+            "coupon": coupon
         }
 
     )
@@ -638,7 +650,8 @@ def add_to_cart(request):
             )
 
         cart_item.quantity = new_quantity
-
+        if coupon:
+            cart_item.coupon = coupon
         cart_item.save()
 
     return Response(
@@ -688,6 +701,8 @@ def get_cart(request):
             price,
             item.variant.product.offer
         )
+        if item.coupon and item.coupon.is_valid:
+            discounted_price = discounted_price - (discounted_price * item.coupon.discount_percentage / 100)
 
         subtotal += (
             discounted_price *
@@ -909,17 +924,16 @@ def place_order(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
-        original_price = item.variant_unit.price
+        original_price = (item.variant.price or 0) if item.variant.price_type == "single" else ((item.variant_unit.price or 0) if item.variant_unit else 0)
 
         discounted_price = calculate_offer_price(
             original_price,
             item.variant.product.offer
         )
+        if item.coupon and item.coupon.is_valid:
+            discounted_price = discounted_price - (discounted_price * item.coupon.discount_percentage / 100)
 
-        discount_amount = calculate_discount_amount(
-            original_price,
-            item.variant.product.offer
-        )
+        discount_amount = original_price - discounted_price
 
         original_subtotal += (
             original_price *
@@ -961,17 +975,23 @@ def place_order(request):
     
     for item in cart_items:
 
-        original_price = item.variant_unit.price
+        original_price = (item.variant.price or 0) if item.variant.price_type == "single" else ((item.variant_unit.price or 0) if item.variant_unit else 0)
 
         discounted_price = calculate_offer_price(
             original_price,
             item.variant.product.offer
         )
+        if item.coupon and item.coupon.is_valid:
+            discounted_price = discounted_price - (discounted_price * item.coupon.discount_percentage / 100)
+            
+            CouponUsage.objects.get_or_create(
+                coupon=item.coupon,
+                user=request.user,
+                product=item.variant.product
+            )
+            SavedCoupon.objects.filter(user=request.user, coupon=item.coupon, product=item.variant.product).delete()
 
-        discount_amount = calculate_discount_amount(
-            original_price,
-            item.variant.product.offer
-        )
+        discount_amount = original_price - discounted_price
 
         OrderItem.objects.create(
 
@@ -981,7 +1001,7 @@ def place_order(request):
 
             color=item.variant.color,
 
-            unit=item.variant_unit.unit,
+            unit=item.variant_unit.unit if item.variant_unit else None,
 
             quantity=item.quantity,
 
@@ -998,9 +1018,9 @@ def place_order(request):
 
         )
 
-        item.variant_unit.stock -= item.quantity
-
-        item.variant_unit.save()
+        if item.variant_unit:
+            item.variant_unit.stock -= item.quantity
+            item.variant_unit.save()
 
     cart_items.delete()
 
@@ -2378,11 +2398,22 @@ def validate_coupon(request):
     if not (coupon.is_active and coupon.start_date <= now <= coupon.end_date):
         return Response({'message': 'Coupon is expired or inactive'}, status=status.HTTP_400_BAD_REQUEST)
 
-    if coupon.products.exists() and not coupon.products.filter(id=product_id).exists():
+    if not coupon.products.filter(id=product_id).exists():
         return Response({'message': 'Coupon is not applicable for this product'}, status=status.HTTP_400_BAD_REQUEST)
         
-    if CouponUsage.objects.filter(coupon=coupon, user=request.user, product_id=product_id).exists():
-        return Response({'message': 'You have already used this coupon for this product'}, status=status.HTTP_400_BAD_REQUEST)
+    if CouponUsage.objects.filter(coupon=coupon, user=request.user).exists():
+        return Response({'message': 'You have already used this coupon'}, status=status.HTTP_400_BAD_REQUEST)
+        
+    SavedCoupon.objects.update_or_create(
+        user=request.user,
+        product_id=product_id,
+        defaults={'coupon': coupon}
+    )
+    
+    Cart.objects.filter(
+        user=request.user,
+        variant__product_id=product_id
+    ).update(coupon=coupon)
         
     return Response({
         'message': 'Coupon applied successfully',

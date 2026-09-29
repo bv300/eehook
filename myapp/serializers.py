@@ -432,38 +432,37 @@ class CartSerializer(serializers.ModelSerializer):
         obj
     ):
         price = (obj.variant.price or 0) if obj.variant.price_type == "single" else ((obj.variant_unit.price or 0) if obj.variant_unit else 0)
-        return calculate_offer_price(
+        dp = calculate_offer_price(
             price,
             obj.variant.product.offer
         )
+        if getattr(obj, 'coupon', None) and obj.coupon.is_valid:
+            dp = dp - (dp * obj.coupon.discount_percentage / 100)
+        return dp
 
     def get_discount_amount(
         self,
         obj
     ):
         price = (obj.variant.price or 0) if obj.variant.price_type == "single" else ((obj.variant_unit.price or 0) if obj.variant_unit else 0)
-        return calculate_discount_amount(
-            price,
-            obj.variant.product.offer
-        )
+        dp = self.get_discounted_price(obj)
+        return price - dp
 
     def get_has_offer(
         self,
         obj
     ):
-        return is_offer_valid(
-            obj.variant.product.offer
-        )
+        has_prod = is_offer_valid(obj.variant.product.offer)
+        has_coup = bool(getattr(obj, 'coupon', None) and obj.coupon.is_valid)
+        return has_prod or has_coup
 
     def get_discount_percentage(
         self,
         obj
     ):
-        if is_offer_valid(
-            obj.variant.product.offer
-        ):
-            return obj.variant.product.offer.discount_percentage
-        return 0
+        p_pct = obj.variant.product.offer.discount_percentage if is_offer_valid(obj.variant.product.offer) else 0
+        c_pct = obj.coupon.discount_percentage if getattr(obj, 'coupon', None) and obj.coupon.is_valid else 0
+        return p_pct + c_pct
 
     def get_total_price(
         self,

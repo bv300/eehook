@@ -289,6 +289,7 @@ class Cart(models.Model):
     variant = models.ForeignKey( ProductVariant, on_delete=models.CASCADE )
     variant_unit = models.ForeignKey( ProductVariantUnit,on_delete=models.CASCADE, null=True, blank=True)
     quantity = models.PositiveIntegerField( default=1)
+    coupon = models.ForeignKey('Coupon', on_delete=models.SET_NULL, null=True, blank=True)
     created_at = models.DateTimeField( auto_now_add=True )
 
     class Meta:
@@ -569,3 +570,15 @@ class CouponUsage(models.Model):
 
     def __str__(self):
         return f"{self.user.email} - {self.coupon.code} on {self.product}"
+
+class SavedCoupon(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="saved_coupons")
+    coupon = models.ForeignKey(Coupon, on_delete=models.CASCADE)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('user', 'product')
+
+    def __str__(self):
+        return f"{self.user.email} saved {self.coupon.code} for {self.product.name}"
