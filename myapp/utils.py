@@ -105,14 +105,12 @@ def get_product_prices(product):
     prices = []
 
     for variant in product.variants.all():
-
-        for size in variant.sizes.all():
-
-            prices.append(
-                Decimal(
-                    str(size.price)
-                )
-            )
+        if variant.price_type == "single":
+            if variant.price is not None:
+                prices.append(Decimal(str(variant.price)))
+        else:
+            for size in variant.sizes.all():
+                prices.append(Decimal(str(size.price)))
 
     if not prices:
 

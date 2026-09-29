@@ -135,7 +135,7 @@ class Product(models.Model):
     emi_available = models.BooleanField(default=False)
     emi_starting_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     current_viewers_count = models.PositiveIntegerField(default=0)
-    promotional_banner_url = models.URLField(max_length=500, blank=True, null=True)
+    promotional_banner_image = models.ImageField(upload_to="promotional_banners/", blank=True, null=True)
     promotional_banner_link = models.URLField(max_length=500, blank=True, null=True)
 
     def __str__(self):
@@ -165,9 +165,16 @@ class ProductView(models.Model):
 
 
 class ProductVariant(models.Model):
+    PRICE_TYPE_CHOICES = (
+        ("single", "Single Price"),
+        ("multiple", "Multiple Price"),
+    )
     product = models.ForeignKey( Product, on_delete=models.CASCADE, related_name="variants" )
     color = models.ForeignKey(Color,on_delete=models.CASCADE, null=True, blank=True )
     regions = models.ManyToManyField(Region, blank=True)
+    
+    price_type = models.CharField(max_length=20, choices=PRICE_TYPE_CHOICES, default="single")
+    price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="For single price")
 
     class Meta:
         unique_together = (
@@ -190,7 +197,8 @@ class ProductVariant(models.Model):
 class ProductVariantUnit(models.Model):
 
     variant = models.ForeignKey(ProductVariant,on_delete=models.CASCADE, related_name="sizes" )
-    unit = models.ForeignKey( Unit,  on_delete=models.CASCADE, null=True, blank=True )
+    unit_type = models.ForeignKey(UnitType, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Unit (e.g. GB/KG)")
+    unit = models.ForeignKey( Unit,  on_delete=models.CASCADE, null=True, blank=True, verbose_name="Quantity (e.g. 128, 1)")
     price = models.DecimalField( max_digits=10,decimal_places=2)
     stock = models.PositiveIntegerField( default=0)
 
@@ -250,6 +258,7 @@ class Wishlist(models.Model):
     class Meta:
         unique_together = (
             "user",
+            "variant",
             "variant_unit"
         )
 
@@ -278,13 +287,14 @@ class Cart(models.Model):
 
     user = models.ForeignKey( User, on_delete=models.CASCADE )
     variant = models.ForeignKey( ProductVariant, on_delete=models.CASCADE )
-    variant_unit = models.ForeignKey( ProductVariantUnit,on_delete=models.CASCADE)
+    variant_unit = models.ForeignKey( ProductVariantUnit,on_delete=models.CASCADE, null=True, blank=True)
     quantity = models.PositiveIntegerField( default=1)
     created_at = models.DateTimeField( auto_now_add=True )
 
     class Meta:
         unique_together = (
             "user",
+            "variant",
             "variant_unit"
         )
 
@@ -517,3 +527,45 @@ class HeroSideBanner(models.Model):
 
     def __str__(self):
         return f"Hero Side Banner {self.id}"
+
+class Coupon(models.Model):
+
+    code = models.CharField(max_length=50, unique=True, blank=True, help_text="Leave blank to auto-generate")
+    products = models.ManyToManyField(Product, blank=True, related_name="coupons", help_text="Select specific products. Leave blank to apply to ALL products.")
+    discount_percentage = models.DecimalField(max_digits=5, decimal_places=2)
+    start_date = models.DateTimeField()
+    end_date = models.DateTimeField()
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.code
+
+    def save(self, *args, **kwargs):
+        if not self.code:
+            import string, random
+            while True:
+                code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+                if not Coupon.objects.filter(code=code).exists():
+                    self.code = code
+                    break
+        super().save(*args, **kwargs)
+
+    @property
+    def is_valid(self):
+        from django.utils import timezone
+        now = timezone.now()
+        return self.is_active and self.start_date <= now <= self.end_date
+
+class CouponUsage(models.Model):
+
+    coupon = models.ForeignKey(Coupon, on_delete=models.CASCADE, related_name="usages")
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="used_coupons")
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="coupon_usages", null=True)
+    used_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('coupon', 'user', 'product')
+
+    def __str__(self):
+        return f"{self.user.email} - {self.coupon.code} on {self.product}"

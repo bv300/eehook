@@ -444,11 +444,11 @@ def add_to_wishlist(request):
     variant_id = request.data.get("variant")
     variant_unit_id = request.data.get("variant_size")
 
-    if not variant_id or not variant_unit_id:
+    if not variant_id:
 
         return Response(
             {
-                "error": "Variant and variant unit are required"
+                "error": "Variant is required"
             },
             status=400
         )
@@ -468,21 +468,14 @@ def add_to_wishlist(request):
             status=404
         )
 
+    variant_unit = None
     try:
-
-        variant_unit = ProductVariantUnit.objects.get(
-            id=variant_unit_id,
-            variant=variant
-        )
-
+        if variant_unit_id:
+            variant_unit = ProductVariantUnit.objects.get(id=variant_unit_id, variant=variant)
+        else:
+            variant_unit = ProductVariantUnit.objects.filter(variant=variant).first()
     except ProductVariantUnit.DoesNotExist:
-
-        return Response(
-            {
-                "error": "Variant unit not found"
-            },
-            status=404
-        )
+        return Response({"error": "Variant unit not found"}, status=404)
 
     wishlist, created = Wishlist.objects.get_or_create(
 
@@ -599,51 +592,22 @@ def add_to_cart(request):
             id=variant_id
         )
 
-        variant_unit = ProductVariantUnit.objects.select_related(
-            "variant"
-        ).get(
-            id=variant_unit_id
-        )
+        variant_unit = None
+        if variant_unit_id:
+            variant_unit = ProductVariantUnit.objects.select_related("variant").get(id=variant_unit_id)
+        else:
+            variant_unit = ProductVariantUnit.objects.select_related("variant").filter(variant=variant).first()
 
     except ProductVariant.DoesNotExist:
-
-        return Response(
-            {
-                "message":
-                "Variant not found"
-            },
-            status=status.HTTP_404_NOT_FOUND
-        )
-
+        return Response({"message": "Variant not found"}, status=status.HTTP_404_NOT_FOUND)
     except ProductVariantUnit.DoesNotExist:
+        return Response({"message": "Variant unit not found"}, status=status.HTTP_404_NOT_FOUND)
 
-        return Response(
-            {
-                "message":
-                "Variant unit not found"
-            },
-            status=status.HTTP_404_NOT_FOUND
-        )
+    if variant_unit and variant_unit.variant != variant:
+        return Response({"message": "Invalid unit selected"}, status=status.HTTP_400_BAD_REQUEST)
 
-    if variant_unit.variant != variant:
-
-        return Response(
-            {
-                "message":
-                "Invalid unit selected"
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    if quantity > variant_unit.stock:
-
-        return Response(
-            {
-                "message":
-                f"Only {variant_unit.stock} items available in stock"
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
+    if variant_unit and quantity > variant_unit.stock:
+        return Response({"message": f"Only {variant_unit.stock} items available in stock"}, status=status.HTTP_400_BAD_REQUEST)
 
     cart_item, created = Cart.objects.get_or_create(
 
@@ -719,8 +683,9 @@ def get_cart(request):
 
     for item in cart:
 
+        price = (item.variant.price or 0) if item.variant.price_type == "single" else ((item.variant_unit.price or 0) if item.variant_unit else 0)
         discounted_price = calculate_offer_price(
-            item.variant_unit.price,
+            price,
             item.variant.product.offer
         )
 
@@ -2383,3 +2348,44 @@ def get_hero_side_banner(request):
         serializer = HeroSideBannerSerializer(banner)
         return Response(serializer.data)
     return Response({})
+
+from rest_framework import viewsets, filters
+from rest_framework.permissions import IsAdminUser
+from django.utils import timezone
+
+class CouponViewSet(viewsets.ModelViewSet):
+    queryset = Coupon.objects.all()
+    serializer_class = CouponSerializer
+    permission_classes = [IsAuthenticated, IsAdminUser]
+    filter_backends = [filters.SearchFilter]
+    search_fields = ['code', 'products__name']
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def validate_coupon(request):
+    code = request.data.get('code')
+    product_id = request.data.get('product_id')
+
+    if not code or not product_id:
+        return Response({'message': 'Coupon code and product_id are required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        coupon = Coupon.objects.get(code=code)
+    except Coupon.DoesNotExist:
+        return Response({'message': 'Invalid coupon code'}, status=status.HTTP_404_NOT_FOUND)
+        
+    now = timezone.now()
+    if not (coupon.is_active and coupon.start_date <= now <= coupon.end_date):
+        return Response({'message': 'Coupon is expired or inactive'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if coupon.products.exists() and not coupon.products.filter(id=product_id).exists():
+        return Response({'message': 'Coupon is not applicable for this product'}, status=status.HTTP_400_BAD_REQUEST)
+        
+    if CouponUsage.objects.filter(coupon=coupon, user=request.user, product_id=product_id).exists():
+        return Response({'message': 'You have already used this coupon for this product'}, status=status.HTTP_400_BAD_REQUEST)
+        
+    return Response({
+        'message': 'Coupon applied successfully',
+        'discount_percentage': coupon.discount_percentage,
+        'coupon_id': coupon.id
+    }, status=status.HTTP_200_OK)

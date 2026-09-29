@@ -95,5 +95,16 @@ path(
         "api/hero-side-banner/",
         views.get_hero_side_banner,
         name="hero-side-banner"
-    )
+    ),
+    path(
+        "validate-coupon/", 
+        views.validate_coupon, 
+        name="validate-coupon"
+    ),
 ]
+
+from rest_framework.routers import DefaultRouter
+router = DefaultRouter()
+router.register(r'admin-coupons', views.CouponViewSet, basename='admin-coupon')
+
+urlpatterns += router.urls

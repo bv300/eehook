@@ -224,7 +224,7 @@ class ProductVariantUnitSerializer(
     ):
 
         return calculate_offer_price(
-            obj.price,
+            obj.price or 0,
             obj.variant.product.offer
         )
 
@@ -234,7 +234,7 @@ class ProductVariantUnitSerializer(
     ):
 
         return calculate_discount_amount(
-            obj.price,
+            obj.price or 0,
             obj.variant.product.offer
         )
 
@@ -266,11 +266,6 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         read_only=True
     )
 
-    regions = RegionSerializer(
-        many=True,
-        read_only=True
-    )
-
     sizes = ProductVariantUnitSerializer(
         many=True,
         read_only=True
@@ -281,6 +276,11 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         read_only=True
     )
 
+    discounted_price = serializers.SerializerMethodField()
+    discount_amount = serializers.SerializerMethodField()
+    has_offer = serializers.SerializerMethodField()
+    discount_percentage = serializers.SerializerMethodField()
+
 
     class Meta:
         model = ProductVariant
@@ -288,10 +288,33 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "color",
-            "regions",
             "sizes",
-            "images"
+            "images",
+            "price_type",
+            "price",
+            "discounted_price",
+            "discount_amount",
+            "has_offer",
+            "discount_percentage"
         ]
+
+    def get_discounted_price(self, obj):
+        if obj.price_type == "single" and obj.price is not None:
+            return calculate_offer_price(obj.price, obj.product.offer)
+        return None
+
+    def get_discount_amount(self, obj):
+        if obj.price_type == "single" and obj.price is not None:
+            return calculate_discount_amount(obj.price, obj.product.offer)
+        return None
+
+    def get_has_offer(self, obj):
+        return is_offer_valid(obj.product.offer)
+
+    def get_discount_percentage(self, obj):
+        if is_offer_valid(obj.product.offer):
+            return obj.product.offer.discount_percentage
+        return 0
 
 
 class CartSerializer(serializers.ModelSerializer):
@@ -318,31 +341,26 @@ class CartSerializer(serializers.ModelSerializer):
 
     product_image = serializers.SerializerMethodField()
 
-    color = serializers.CharField(
-        source="variant.color.name",
-        read_only=True
-    )
+    color = serializers.SerializerMethodField()
 
-    size = serializers.CharField(
-        source="variant_unit.unit.name",
-        read_only=True
-    )
+    size = serializers.SerializerMethodField()
 
-    unit_type = serializers.CharField(
-        source="variant_unit.unit.unit_type.name",
-        read_only=True
-    )
+    unit_type = serializers.SerializerMethodField()
 
-    original_price = serializers.DecimalField(
-        source="variant_unit.price",
-        max_digits=10,
-        decimal_places=2,
-        read_only=True
-    )
-    stock = serializers.IntegerField(
-        source="variant_unit.stock",
-        read_only=True
-    )
+    original_price = serializers.SerializerMethodField()
+    stock = serializers.SerializerMethodField()
+
+    def get_color(self, obj):
+        return obj.variant.color.name if obj.variant and obj.variant.color else None
+
+    def get_size(self, obj):
+        return obj.variant_unit.unit.name if obj.variant_unit and obj.variant_unit.unit else None
+
+    def get_unit_type(self, obj):
+        return obj.variant_unit.unit.unit_type.name if obj.variant_unit and obj.variant_unit.unit and getattr(obj.variant_unit.unit, 'unit_type', None) else None
+
+    def get_stock(self, obj):
+        return obj.variant_unit.stock if obj.variant_unit else 0
 
     discounted_price = serializers.SerializerMethodField()
 
@@ -402,13 +420,20 @@ class CartSerializer(serializers.ModelSerializer):
 
         return None
 
+    def get_original_price(self, obj):
+        if obj.variant.price_type == "single":
+            return obj.variant.price or 0
+        if obj.variant_unit:
+            return obj.variant_unit.price or 0
+        return 0
+
     def get_discounted_price(
         self,
         obj
     ):
-
+        price = (obj.variant.price or 0) if obj.variant.price_type == "single" else ((obj.variant_unit.price or 0) if obj.variant_unit else 0)
         return calculate_offer_price(
-            obj.variant_unit.price,
+            price,
             obj.variant.product.offer
         )
 
@@ -416,9 +441,9 @@ class CartSerializer(serializers.ModelSerializer):
         self,
         obj
     ):
-
+        price = (obj.variant.price or 0) if obj.variant.price_type == "single" else ((obj.variant_unit.price or 0) if obj.variant_unit else 0)
         return calculate_discount_amount(
-            obj.variant_unit.price,
+            price,
             obj.variant.product.offer
         )
 
@@ -426,7 +451,6 @@ class CartSerializer(serializers.ModelSerializer):
         self,
         obj
     ):
-
         return is_offer_valid(
             obj.variant.product.offer
         )
@@ -435,25 +459,17 @@ class CartSerializer(serializers.ModelSerializer):
         self,
         obj
     ):
-
         if is_offer_valid(
             obj.variant.product.offer
         ):
-
             return obj.variant.product.offer.discount_percentage
-
         return 0
 
     def get_total_price(
         self,
         obj
     ):
-
-        discounted_price = calculate_offer_price(
-            obj.variant_unit.price,
-            obj.variant.product.offer
-        )
-
+        discounted_price = self.get_discounted_price(obj)
         return discounted_price * obj.quantity
     
     
@@ -806,34 +822,26 @@ class WishlistSerializer(serializers.ModelSerializer):
         read_only=True
     )
 
-    color = serializers.CharField(
-        source="variant.color.name",
-        read_only=True
-    )
+    color = serializers.SerializerMethodField()
+    size = serializers.SerializerMethodField()
+    unit_type = serializers.SerializerMethodField()
+    stock = serializers.SerializerMethodField()
 
-    size = serializers.CharField(
-        source="variant_unit.unit.name",
-        read_only=True
-    )
+    def get_color(self, obj):
+        return obj.variant.color.name if obj.variant and obj.variant.color else None
 
-    unit_type = serializers.CharField(
-        source="variant_unit.unit.unit_type.name",
-        read_only=True
-    )
+    def get_size(self, obj):
+        return obj.variant_unit.unit.name if obj.variant_unit and obj.variant_unit.unit else None
 
-    stock = serializers.IntegerField(
-        source="variant_unit.stock",
-        read_only=True
-    )
+    def get_unit_type(self, obj):
+        return obj.variant_unit.unit.unit_type.name if obj.variant_unit and obj.variant_unit.unit and getattr(obj.variant_unit.unit, 'unit_type', None) else None
+
+    def get_stock(self, obj):
+        return obj.variant_unit.stock if obj.variant_unit else 0
 
     product_image = serializers.SerializerMethodField()
 
-    original_price = serializers.DecimalField(
-        source="variant_unit.price",
-        max_digits=10,
-        decimal_places=2,
-        read_only=True
-    )
+    original_price = serializers.SerializerMethodField()
 
     discounted_price = serializers.SerializerMethodField()
 
@@ -881,23 +889,33 @@ class WishlistSerializer(serializers.ModelSerializer):
 
         return image.image.url if image else None
 
-    def get_discounted_price(self, obj):
-
-        if not obj.variant or not obj.variant_unit:
+    def get_original_price(self, obj):
+        if not obj.variant:
             return None
+    def get_original_price(self, obj):
+        if not obj.variant:
+            return None
+        if obj.variant.price_type == "single":
+            return obj.variant.price or 0
+        if obj.variant_unit:
+            return obj.variant_unit.price or 0
+        return 0
 
+    def get_discounted_price(self, obj):
+        if not obj.variant:
+            return None
+        price = (obj.variant.price or 0) if obj.variant.price_type == "single" else ((obj.variant_unit.price or 0) if obj.variant_unit else 0)
         return calculate_offer_price(
-            obj.variant_unit.price,
+            price,
             obj.variant.product.offer
         )
 
     def get_discount_amount(self, obj):
-
-        if not obj.variant or not obj.variant_unit:
+        if not obj.variant:
             return 0
-
+        price = (obj.variant.price or 0) if obj.variant.price_type == "single" else ((obj.variant_unit.price or 0) if obj.variant_unit else 0)
         return calculate_discount_amount(
-            obj.variant_unit.price,
+            price,
             obj.variant.product.offer
         )
 
@@ -980,7 +998,7 @@ class ProductSerializer(serializers.ModelSerializer):
             "emi_available",
             "emi_starting_price",
             "current_viewers_count",
-            "promotional_banner_url",
+            "promotional_banner_image",
             "promotional_banner_link",
         ]
 
@@ -1117,4 +1135,9 @@ class PromoBannerSerializer(serializers.ModelSerializer):
 class HeroSideBannerSerializer(serializers.ModelSerializer):
     class Meta:
         model = HeroSideBanner
+        fields = "__all__"
+
+class CouponSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Coupon
         fields = "__all__"

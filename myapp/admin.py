@@ -76,12 +76,21 @@ class ProductVariantSizeInline( nested_admin.NestedTabularInline):
 
     model = ProductVariantUnit
     extra = 1
+    fields = ('unit_type', 'unit', 'price', 'stock')
+
+class ProductVariantForm(forms.ModelForm):
+    class Meta:
+        model = ProductVariant
+        exclude = ('regions',)
+        widgets = {
+            'price_type': forms.RadioSelect(choices=ProductVariant.PRICE_TYPE_CHOICES),
+        }
 
 class ProductVariantInline( nested_admin.NestedStackedInline ):
 
     model = ProductVariant
+    form = ProductVariantForm
     extra = 1
-    autocomplete_fields = ('regions',)
     inlines = [
         ProductImageInline,
         ProductVariantSizeInline
@@ -114,6 +123,9 @@ class ProductAdminForm(forms.ModelForm):
 @admin.register(Product)
 class ProductAdmin(nested_admin.NestedModelAdmin):
     form = ProductAdminForm
+    
+    class Media:
+        js = ('js/price_toggle.js',)
 
     def get_form(self, request, obj=None, **kwargs):
         form = super().get_form(request, obj, **kwargs)
@@ -157,7 +169,7 @@ class ProductAdmin(nested_admin.NestedModelAdmin):
         ),
 
         ("Promotional & Social",
-            {"fields": ("current_viewers_count", "promotional_banner_url", "promotional_banner_link")}
+            {"fields": ("current_viewers_count", "promotional_banner_image", "promotional_banner_link")}
         ),
 
         ("Status",
@@ -240,3 +252,27 @@ class PromoBannerAdmin(admin.ModelAdmin):
 class HeroSideBannerAdmin(admin.ModelAdmin):
     list_display = ("id", "is_active", "link")
     list_filter = ("is_active",)
+
+from django.utils.html import format_html
+
+@admin.register(Coupon)
+class CouponAdmin(admin.ModelAdmin):
+    list_display = ('code', 'copy_code_button', 'discount_percentage', 'start_date', 'end_date', 'is_active')
+    search_fields = ('code', 'products__name')
+    autocomplete_fields = ('products',)
+    list_filter = ('is_active', 'start_date', 'end_date')
+
+    def copy_code_button(self, obj):
+        if obj.code:
+            return format_html(
+                '<button type="button" onclick="navigator.clipboard.writeText(\'{}\'); alert(\'Copied: {}\')" style="cursor: pointer; padding: 2px 6px; background-color: #417690; color: white; border: none; border-radius: 3px;">Copy</button>',
+                obj.code, obj.code
+            )
+        return "-"
+    copy_code_button.short_description = "Copy Code"
+
+@admin.register(CouponUsage)
+class CouponUsageAdmin(admin.ModelAdmin):
+    list_display = ('user', 'coupon', 'product', 'used_at')
+    search_fields = ('user__email', 'coupon__code', 'product__name')
+    list_filter = ('used_at',)
