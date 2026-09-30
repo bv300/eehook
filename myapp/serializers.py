@@ -295,7 +295,8 @@ class ProductVariantSerializer(serializers.ModelSerializer):
             "discounted_price",
             "discount_amount",
             "has_offer",
-            "discount_percentage"
+            "discount_percentage",
+            "stock"
         ]
 
     def get_discounted_price(self, obj):

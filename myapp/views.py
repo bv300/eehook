@@ -595,7 +595,7 @@ def add_to_cart(request):
         variant_unit = None
         if variant_unit_id:
             variant_unit = ProductVariantUnit.objects.select_related("variant").get(id=variant_unit_id)
-        else:
+        elif variant.price_type == "multiple":
             variant_unit = ProductVariantUnit.objects.select_related("variant").filter(variant=variant).first()
 
     except ProductVariant.DoesNotExist:
@@ -603,16 +603,17 @@ def add_to_cart(request):
     except ProductVariantUnit.DoesNotExist:
         return Response({"message": "Variant unit not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    if not variant_unit:
-        # For both single and multiple price types, a ProductVariantUnit is required to track stock.
-        # If it's missing, treat it as out of stock.
-        return Response({"message": "Out of stock"}, status=status.HTTP_400_BAD_REQUEST)
+    if variant.price_type == "multiple":
+        if not variant_unit:
+            return Response({"message": "Out of stock"}, status=status.HTTP_400_BAD_REQUEST)
+        if variant_unit.variant != variant:
+            return Response({"message": "Invalid unit selected"}, status=status.HTTP_400_BAD_REQUEST)
+        available_stock = variant_unit.stock
+    else:
+        available_stock = variant.stock
 
-    if variant_unit.variant != variant:
-        return Response({"message": "Invalid unit selected"}, status=status.HTTP_400_BAD_REQUEST)
-
-    if quantity > variant_unit.stock:
-        return Response({"message": f"Only {variant_unit.stock} items available in stock"}, status=status.HTTP_400_BAD_REQUEST)
+    if quantity > available_stock:
+        return Response({"message": f"Only {available_stock} items available in stock"}, status=status.HTTP_400_BAD_REQUEST)
 
     saved_coupon = SavedCoupon.objects.filter(user=request.user, product=variant.product).first()
     coupon = saved_coupon.coupon if saved_coupon and saved_coupon.coupon.is_valid else None
@@ -639,12 +640,12 @@ def add_to_cart(request):
 
         new_quantity = cart_item.quantity + quantity
 
-        if new_quantity > variant_unit.stock:
+        if new_quantity > available_stock:
 
             return Response(
                 {
                     "message":
-                    f"Only {variant_unit.stock} items available in stock"
+                    f"Only {available_stock} items available in stock"
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
@@ -776,12 +777,14 @@ def update_cart_quantity(request, id):
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    if quantity > cart.variant_unit.stock:
+    available_stock = cart.variant_unit.stock if cart.variant.price_type == "multiple" and cart.variant_unit else cart.variant.stock
+
+    if quantity > available_stock:
 
         return Response(
             {
                 "message":
-                f"Only {cart.variant_unit.stock} items available in stock"
+                f"Only {available_stock} items available in stock"
             },
             status=status.HTTP_400_BAD_REQUEST
         )
@@ -914,12 +917,14 @@ def place_order(request):
 
     for item in cart_items:
 
-        if item.quantity > item.variant_unit.stock:
+        available_stock = item.variant_unit.stock if item.variant.price_type == "multiple" and item.variant_unit else item.variant.stock
+
+        if item.quantity > available_stock:
 
             return Response(
                 {
                     "message":
-                    f"Only {item.variant_unit.stock} items available for {item.variant.product.name}"
+                    f"Only {available_stock} items available for {item.variant.product.name}"
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
@@ -1009,18 +1014,20 @@ def place_order(request):
 
             discount_amount=discount_amount,
 
-            price=discounted_price,
-
             total_price=(
                 discounted_price *
                 item.quantity
-            )
+            ),
+            variant_unit=item.variant_unit
 
         )
 
-        if item.variant_unit:
+        if item.variant.price_type == "multiple" and item.variant_unit:
             item.variant_unit.stock -= item.quantity
             item.variant_unit.save()
+        else:
+            item.variant.stock -= item.quantity
+            item.variant.save()
 
     cart_items.delete()
 
@@ -1557,10 +1564,14 @@ def cancel_order(request, id):
         )
 
     for item in order.items.all():
-
-        item.variant_unit.stock += item.quantity
-
-        item.variant_unit.save()
+        if item.variant_unit:
+            item.variant_unit.stock += item.quantity
+            item.variant_unit.save()
+        else:
+            variant = ProductVariant.objects.filter(product=item.product, color=item.color).first()
+            if variant:
+                variant.stock += item.quantity
+                variant.save()
 
     order.status = "Cancelled"
 

@@ -175,6 +175,7 @@ class ProductVariant(models.Model):
     
     price_type = models.CharField(max_length=20, choices=PRICE_TYPE_CHOICES, default="single")
     price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="For single price")
+    stock = models.PositiveIntegerField(default=0, help_text="For single price")
 
     class Meta:
         unique_together = (
