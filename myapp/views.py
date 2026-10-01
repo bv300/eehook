@@ -19,10 +19,11 @@ def health_check(request):
 
 from .serializers import *
 
-from .models import User
+from .models import *
 
 
 from rest_framework.permissions import IsAuthenticated
+from .permissions import IsSuperAdmin
 
 from rest_framework.decorators import (
     api_view,
@@ -89,6 +90,12 @@ def google_login(request):
                     "email": user.email,
                     "first_name": user.first_name,
                     "is_staff": user.is_staff,
+                    "role": user.role,
+                    "redirect_to": (
+                        "/order-dashboard"
+                        if user.role == "Super Admin"
+                        else "/"
+                    ),
                 }
             }
         )
@@ -148,11 +155,32 @@ def login(request):
                 "email": user.email,
                 "first_name": user.first_name,
                 "is_staff": user.is_staff,
-            }
+                "role": user.role,
+                "redirect_to": (
+                    "/order-dashboard"
+                    if user.role == "Super Admin"
+                    else "/"
+                ),
+            },
+        "role": user.role,
+        "redirect_to": (
+            "/order-dashboard" if user.role == "Super Admin" else "/"
+        ),
         },
         status=status.HTTP_200_OK
     )
-    
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def logout(request):
+    """JWT logout endpoint; the client discards its access and refresh tokens."""
+    return Response(
+        {"message": "Logged out successfully."},
+        status=status.HTTP_200_OK,
+    )
+
+
 @api_view(["POST"])
 def forgot_password(request):
 
@@ -1614,17 +1642,8 @@ def order_details(request, id):
 from django.db.models import Q, Sum
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsSuperAdmin])
 def admin_dashboard_cards(request):
-
-    if not request.user.is_staff:
-
-        return Response(
-            {
-                "error": "Unauthorized"
-            },
-            status=403
-        )
 
     total_revenue = (
         Order.objects.filter(
@@ -1660,7 +1679,11 @@ def admin_dashboard_cards(request):
 
         "cancelled_orders": Order.objects.filter(
             status="Cancelled"
-        ).count()
+        ).count(),
+        "total_revenue": total_revenue,
+        "total_customers": User.objects.filter(is_active=True).count(),
+        "total_products": Product.objects.count(),
+        "active_coupons": Coupon.objects.filter(is_active=True).count(),
 
     }
 

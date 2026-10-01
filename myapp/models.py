@@ -24,6 +24,7 @@ class UserManager(BaseUserManager):
         extra_fields.setdefault("is_staff", True)
         extra_fields.setdefault("is_superuser", True)
         extra_fields.setdefault("is_active", True)
+        extra_fields.setdefault("role", "Super Admin")
 
         return self.create_user(
             email,
@@ -33,8 +34,14 @@ class UserManager(BaseUserManager):
 
 class User(AbstractUser):
 
+    ROLE_CHOICES = (
+        ("Customer", "Customer"),
+        ("Super Admin", "Super Admin"),
+    )
+
     username = None
     email = models.EmailField( unique=True )
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default="Customer")
 
     USERNAME_FIELD = "email"
 
@@ -264,25 +271,22 @@ class Wishlist(models.Model):
         )
 
     def __str__(self):
-
+        product_name = (
+            self.variant.product.name
+            if self.variant and self.variant.product
+            else "Unknown product"
+        )
         color = (
             self.variant.color.name
-            if self.variant.color
-            else ""
+            if self.variant and self.variant.color
+            else "No color"
         )
-
         unit = (
             self.variant_unit.unit.name
-            if self.variant_unit.unit
-            else ""
+            if self.variant_unit and self.variant_unit.unit
+            else "No unit"
         )
-
-        return (
-            f"{self.user.email} - "
-            f"{self.variant.product.name} - "
-            f"{color} - "
-            f"{unit}"
-        )
+        return f"{self.user.email} - {product_name} - {color} - {unit}"
         
 class Cart(models.Model):
 
@@ -301,12 +305,22 @@ class Cart(models.Model):
         )
 
     def __str__(self):
-        return (
-            f"{self.user.email} - "
-            f"{self.variant.product.name} - "
-            f"{self.variant.color.name} - "
-            f"{self.variant_unit.unit.name}"
+        product_name = (
+            self.variant.product.name
+            if self.variant and self.variant.product
+            else "Unknown product"
         )
+        color_name = (
+            self.variant.color.name
+            if self.variant and self.variant.color
+            else "No color"
+        )
+        unit_name = (
+            self.variant_unit.unit.name
+            if self.variant_unit and self.variant_unit.unit
+            else "No unit"
+        )
+        return f"{self.user.email} - {product_name} - {color_name} - {unit_name}"
 
 class Address(models.Model):
 
@@ -417,8 +431,31 @@ class Order(models.Model):
         auto_now_add=True
     )
 
+    updated_at = models.DateTimeField(auto_now=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancelled_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cancelled_orders",
+    )
+
     def __str__(self):
         return f"ORD-{self.id:06d}"
+
+
+class AdminAuditLog(models.Model):
+    admin_user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    action = models.CharField(max_length=50)
+    entity_type = models.CharField(max_length=50)
+    entity_id = models.CharField(max_length=100)
+    description = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    ip_address = models.GenericIPAddressField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("-created_at",)
 
 class OrderItem(models.Model):
 

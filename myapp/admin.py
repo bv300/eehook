@@ -3,20 +3,22 @@ from django.contrib import admin
 from django import forms
 from .models import *
 
-admin.site.site_header = "eehook Admin"
-admin.site.site_title = "eehook"
-admin.site.index_title = "Welcome To eehook Admin Dashboard"
+admin.site.site_header = "Order Dashboard"
+admin.site.site_title = "Order Dashboard"
+admin.site.index_title = "Order Dashboard"
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):
 
     list_display = (
         "email",
+        "role",
         "is_staff",
         "is_active"
     )
 
     search_fields = ( "email",)
+    list_filter = ("role", "is_active")
 
 @admin.register(Category)
 class CategoryAdmin(admin.ModelAdmin):
@@ -216,7 +218,31 @@ class AddressAdmin(admin.ModelAdmin):
     )
 
 admin.site.register(UserProfile)
-admin.site.register(Order)
+
+
+@admin.register(Order)
+class OrderAdmin(admin.ModelAdmin):
+
+    list_display = (
+        "order_number",
+        "customer_email",
+        "total_amount",
+        "payment_status",
+        "status",
+        "created_at",
+    )
+    list_filter = ("status", "payment_status", "created_at")
+    search_fields = ("user__email", "user__first_name", "stripe_session_id")
+    ordering = ("-created_at",)
+
+    @admin.display(description="Order")
+    def order_number(self, obj):
+        return str(obj)
+
+    @admin.display(description="Customer")
+    def customer_email(self, obj):
+        return obj.user.email
+
 admin.site.register(OrderItem)
 
 

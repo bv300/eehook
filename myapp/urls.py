@@ -8,6 +8,7 @@ urlpatterns = [
     path("token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
     path("google-login/", views.google_login),
     path("login/",views.login),
+    path("logout/", views.logout),
     path("forgot-password/",views.forgot_password),
     path("reset-password/<uidb64>/<token>/",views.reset_password),
     
@@ -104,7 +105,18 @@ path(
 ]
 
 from rest_framework.routers import DefaultRouter
+from .order_admin_api import SuperAdminOrderDetailView, SuperAdminOrderListView
 router = DefaultRouter()
 router.register(r'admin-coupons', views.CouponViewSet, basename='admin-coupon')
 
 urlpatterns += router.urls
+
+# Strictly protected order-management API for the Support Order Dashboard.
+urlpatterns += [
+    path("orders/", SuperAdminOrderListView.as_view(), name="admin-orders-api"),
+    path(
+        "orders/<int:id>/",
+        SuperAdminOrderDetailView.as_view(),
+        name="admin-order-detail-api",
+    ),
+]
