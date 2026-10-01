@@ -2,7 +2,7 @@ from rest_framework.permissions import BasePermission
 
 
 class IsSuperAdmin(BasePermission):
-    """Allow order administration only to users with the exact role."""
+    """Allow dashboard administration only to users with the exact role."""
 
     message = "Super Admin access required"
 

@@ -623,6 +623,16 @@ def add_to_cart(request):
         variant_unit = None
         if variant_unit_id:
             variant_unit = ProductVariantUnit.objects.select_related("variant").get(id=variant_unit_id)
+            if variant.price_type != "multiple":
+                return Response(
+                    {"message": "A unit can only be selected for a multiple-price product"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if variant_unit.variant_id != variant.id:
+                return Response(
+                    {"message": "Invalid unit selected"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
         elif variant.price_type == "multiple":
             variant_unit = ProductVariantUnit.objects.select_related("variant").filter(variant=variant).first()
 
@@ -821,8 +831,13 @@ def update_cart_quantity(request, id):
 
     cart.save()
 
+    original_price = (
+        cart.variant.price
+        if cart.variant.price_type == "single"
+        else (cart.variant_unit.price if cart.variant_unit else 0)
+    )
     discounted_price = calculate_offer_price(
-        cart.variant_unit.price,
+        original_price or 0,
         cart.variant.product.offer
     )
 
@@ -846,14 +861,15 @@ def update_cart_quantity(request, id):
 
     for item in cart_items:
 
-        subtotal += (
-            calculate_offer_price(
-                item.variant_unit.price,
-                item.variant.product.offer
-            )
-            *
-            item.quantity
+        item_price = (
+            item.variant.price
+            if item.variant.price_type == "single"
+            else (item.variant_unit.price if item.variant_unit else 0)
         )
+        subtotal += calculate_offer_price(
+            item_price or 0,
+            item.variant.product.offer,
+        ) * item.quantity
 
         total_items += item.quantity
 
@@ -917,6 +933,7 @@ def place_order(request):
 
     cart_items = (
         Cart.objects
+        .select_for_update()
         .select_related(
             "variant__product__offer",
             "variant__color",
@@ -925,6 +942,7 @@ def place_order(request):
         .filter(
             user=request.user
         )
+        .order_by("id")
     )
 
     if not cart_items.exists():
@@ -944,6 +962,17 @@ def place_order(request):
     discounted_subtotal = Decimal("0.00")
 
     for item in cart_items:
+
+        # Lock the exact inventory row before checking and reserving stock.
+        # This prevents concurrent orders from overselling the same SKU.
+        if item.variant.price_type == "multiple" and item.variant_unit_id:
+            item.variant_unit = ProductVariantUnit.objects.select_for_update().get(
+                pk=item.variant_unit_id
+            )
+        else:
+            item.variant = ProductVariant.objects.select_for_update().get(
+                pk=item.variant_id
+            )
 
         available_stock = item.variant_unit.stock if item.variant.price_type == "multiple" and item.variant_unit else item.variant.stock
 
@@ -1041,6 +1070,8 @@ def place_order(request):
             original_price=original_price,
 
             discount_amount=discount_amount,
+
+            price=discounted_price,
 
             total_price=(
                 discounted_price *
@@ -2404,13 +2435,14 @@ def get_hero_side_banner(request):
     return Response({})
 
 from rest_framework import viewsets, filters
-from rest_framework.permissions import IsAdminUser
 from django.utils import timezone
 
 class CouponViewSet(viewsets.ModelViewSet):
     queryset = Coupon.objects.all()
     serializer_class = CouponSerializer
-    permission_classes = [IsAuthenticated, IsAdminUser]
+    # Keep the legacy route restricted to the same Super Admin boundary as
+    # the dashboard management API.
+    permission_classes = [IsSuperAdmin]
     filter_backends = [filters.SearchFilter]
     search_fields = ['code', 'products__name']
 

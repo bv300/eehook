@@ -1,0 +1,691 @@
+"""Super Admin management API for the Order Dashboard.
+
+The Django Admin is the source of truth for which records a Super Admin can
+manage. These viewsets expose the same registered models to the dashboard,
+including multipart uploads and the nested Product records used by the admin
+inlines.
+"""
+
+from django.db.models import Min
+from django.db.models.fields import NOT_PROVIDED
+from rest_framework import filters, serializers, viewsets
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
+from rest_framework.response import Response
+from rest_framework.views import APIView
+from rest_framework.pagination import PageNumberPagination
+
+from .models import (
+    Address,
+    AdminAuditLog,
+    Cart,
+    Category,
+    Coupon,
+    CouponUsage,
+    Color,
+    HeroBanner,
+    HeroSideBanner,
+    Offer,
+    Order,
+    OrderItem,
+    Product,
+    ProductImage,
+    ProductVariant,
+    ProductVariantUnit,
+    PromoBanner,
+    Region,
+    SubCategory,
+    Unit,
+    UnitType,
+    User,
+    UserProfile,
+    Wishlist,
+)
+from .permissions import IsSuperAdmin
+
+
+class SuperAdminPagination(PageNumberPagination):
+    page_size = 25
+    page_size_query_param = "page_size"
+    max_page_size = 200
+
+
+class AdminUserSerializer(serializers.ModelSerializer):
+    password = serializers.CharField(
+        write_only=True,
+        required=False,
+        allow_blank=False,
+        style={"input_type": "password"},
+    )
+
+    class Meta:
+        model = User
+        fields = (
+            "id",
+            "email",
+            "password",
+            "first_name",
+            "last_name",
+            "role",
+            "is_staff",
+            "is_active",
+            "is_superuser",
+            "date_joined",
+            "last_login",
+        )
+        read_only_fields = ("id", "date_joined", "last_login")
+
+    def create(self, validated_data):
+        password = validated_data.pop("password", None)
+        user = User(**validated_data)
+        if password:
+            user.set_password(password)
+        else:
+            user.set_unusable_password()
+        user.save()
+        return user
+
+    def update(self, instance, validated_data):
+        password = validated_data.pop("password", None)
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        if password:
+            instance.set_password(password)
+        instance.save()
+        return instance
+
+
+class AdminProductSerializer(serializers.ModelSerializer):
+    # EMI is currently disabled in the dashboard. Accept both JSON null and
+    # multipart form empty strings, then normalize the value to null.
+    emi_available = serializers.BooleanField(required=False, default=False)
+    emi_starting_price = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        required=False,
+        allow_null=True,
+    )
+
+    class Meta:
+        model = Product
+        fields = "__all__"
+        read_only_fields = ("id", "created_at", "updated_at")
+
+    def to_internal_value(self, data):
+        normalized = data.copy()
+        if normalized.get("emi_starting_price") in ("", None):
+            normalized["emi_starting_price"] = None
+        if str(normalized.get("emi_available", "false")).lower() in (
+            "false",
+            "0",
+            "no",
+            "",
+        ):
+            normalized["emi_available"] = False
+            normalized["emi_starting_price"] = None
+        return super().to_internal_value(normalized)
+
+    def validate(self, attrs):
+        category = attrs.get("category", getattr(self.instance, "category", None))
+        subcategory = attrs.get(
+            "subcategory", getattr(self.instance, "subcategory", None)
+        )
+        if category and subcategory and subcategory.category_id != category.id:
+            raise serializers.ValidationError(
+                {"subcategory": "The subcategory must belong to the selected category."}
+            )
+
+        emi_starting_price = attrs.get(
+            "emi_starting_price",
+            getattr(self.instance, "emi_starting_price", None),
+        )
+        if not attrs.get(
+            "emi_available",
+            getattr(self.instance, "emi_available", False),
+        ):
+            attrs["emi_starting_price"] = None
+            return attrs
+        if emi_starting_price is not None and self.instance:
+            minimum_price = ProductVariantUnit.objects.filter(
+                variant__product=self.instance
+            ).aggregate(Min("price"))["price__min"]
+            if minimum_price is not None and emi_starting_price > minimum_price:
+                raise serializers.ValidationError(
+                    {
+                        "emi_starting_price": (
+                            "EMI starting price cannot be greater than the "
+                            "product's lowest variant price."
+                        )
+                    }
+                )
+        return attrs
+
+
+class AdminModelViewSet(viewsets.ModelViewSet):
+    """Common protected CRUD behavior for all Django Admin models."""
+
+    permission_classes = (IsSuperAdmin,)
+    pagination_class = SuperAdminPagination
+    parser_classes = (JSONParser, FormParser, MultiPartParser)
+    filter_backends = (filters.SearchFilter, filters.OrderingFilter)
+    search_fields = ()
+    ordering_fields = "__all__"
+
+    def _audit(self, action, instance, description=""):
+        AdminAuditLog.objects.create(
+            admin_user=self.request.user,
+            action=action,
+            entity_type=instance._meta.label_lower,
+            entity_id=str(instance.pk),
+            description=description or f"{action.title()} {instance}.",
+            ip_address=self.request.META.get("REMOTE_ADDR"),
+        )
+
+    def perform_create(self, serializer):
+        instance = serializer.save()
+        self._audit("create", instance)
+
+    def perform_update(self, serializer):
+        instance = serializer.save()
+        self._audit("update", instance)
+
+    def perform_destroy(self, instance):
+        self._audit("delete", instance)
+        instance.delete()
+
+
+class AdminUserViewSet(AdminModelViewSet):
+    queryset = User.objects.all().order_by("email")
+    serializer_class = AdminUserSerializer
+    search_fields = ("email", "first_name", "last_name", "role")
+
+
+class AdminCategoryViewSet(AdminModelViewSet):
+    queryset = Category.objects.all().order_by("name")
+    serializer_class = serializers.ModelSerializer
+    search_fields = ("name",)
+
+    def get_serializer_class(self):
+        class CategoryAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Category
+                fields = "__all__"
+                read_only_fields = ("id", "created_at")
+
+        return CategoryAdminSerializer
+
+
+class AdminSubCategoryViewSet(AdminModelViewSet):
+    queryset = SubCategory.objects.select_related("category").all().order_by("name")
+    search_fields = ("name", "category__name")
+
+    def get_serializer_class(self):
+        class SubCategoryAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = SubCategory
+                fields = "__all__"
+                read_only_fields = ("id", "created_at")
+
+        return SubCategoryAdminSerializer
+
+
+class AdminOfferViewSet(AdminModelViewSet):
+    queryset = Offer.objects.all().order_by("-created_at")
+    search_fields = ("title", "description")
+
+    def get_serializer_class(self):
+        class OfferAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Offer
+                fields = "__all__"
+                read_only_fields = ("id", "created_at")
+
+        return OfferAdminSerializer
+
+
+class AdminColorViewSet(AdminModelViewSet):
+    queryset = Color.objects.all().order_by("name")
+    search_fields = ("name", "code")
+
+    def get_serializer_class(self):
+        class ColorAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Color
+                fields = "__all__"
+                read_only_fields = ("id",)
+
+        return ColorAdminSerializer
+
+
+class AdminUnitTypeViewSet(AdminModelViewSet):
+    queryset = UnitType.objects.all().order_by("name")
+    search_fields = ("name",)
+
+    def get_serializer_class(self):
+        class UnitTypeAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = UnitType
+                fields = "__all__"
+                read_only_fields = ("id",)
+
+        return UnitTypeAdminSerializer
+
+
+class AdminUnitViewSet(AdminModelViewSet):
+    queryset = Unit.objects.select_related("unit_type").all().order_by("name")
+    search_fields = ("name", "unit_type__name")
+
+    def get_serializer_class(self):
+        class UnitAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Unit
+                # A Unit is only a reusable measurement/label. Inventory
+                # belongs to ProductVariant or ProductVariantUnit, never Unit.
+                fields = ("id", "unit_type", "name")
+                read_only_fields = ("id",)
+
+            def validate(self, attrs):
+                forbidden = {
+                    field: "Unit does not contain inventory or display-order data."
+                    for field in ("stock", "order")
+                    if field in self.initial_data
+                }
+                if forbidden:
+                    raise serializers.ValidationError(forbidden)
+                return attrs
+
+        return UnitAdminSerializer
+
+
+class AdminRegionViewSet(AdminModelViewSet):
+    queryset = Region.objects.all().order_by("name")
+    search_fields = ("name",)
+
+    def get_serializer_class(self):
+        class RegionAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Region
+                fields = "__all__"
+                read_only_fields = ("id",)
+
+        return RegionAdminSerializer
+
+
+class AdminProductViewSet(AdminModelViewSet):
+    queryset = Product.objects.select_related("category", "subcategory", "offer").all()
+    serializer_class = AdminProductSerializer
+    search_fields = ("name", "description", "seller_name", "category__name", "subcategory__name")
+    ordering = ("-created_at",)
+
+
+class AdminProductVariantViewSet(AdminModelViewSet):
+    queryset = ProductVariant.objects.select_related("product", "color").order_by("id")
+    search_fields = ("product__name", "color__name")
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        product_id = self.request.query_params.get("product")
+        if product_id:
+            queryset = queryset.filter(product_id=product_id)
+        return queryset
+
+    def get_serializer_class(self):
+        class ProductVariantAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = ProductVariant
+                # Regions are intentionally disabled for product add/edit.
+                # Keep existing database values intact, but do not expose or
+                # accept this relation through the dashboard management API.
+                fields = ("id", "product", "color", "price_type", "price", "stock")
+                read_only_fields = ("id",)
+
+            def validate(self, attrs):
+                if "regions" in self.initial_data:
+                    raise serializers.ValidationError(
+                        {"regions": "Regions are disabled for product variants."}
+                    )
+                return attrs
+
+        return ProductVariantAdminSerializer
+
+
+class AdminProductVariantUnitViewSet(AdminModelViewSet):
+    queryset = ProductVariantUnit.objects.select_related(
+        "variant__product", "unit", "unit_type"
+    ).all().order_by("id")
+    search_fields = ("variant__product__name", "unit__name", "unit_type__name")
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        variant_id = self.request.query_params.get("variant")
+        product_id = self.request.query_params.get("product")
+        if variant_id:
+            queryset = queryset.filter(variant_id=variant_id)
+        if product_id:
+            queryset = queryset.filter(variant__product_id=product_id)
+        return queryset
+
+    def get_serializer_class(self):
+        class ProductVariantUnitAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = ProductVariantUnit
+                fields = "__all__"
+                read_only_fields = ("id",)
+
+            def validate(self, attrs):
+                variant = attrs.get("variant", getattr(self.instance, "variant", None))
+                price = attrs.get("price", getattr(self.instance, "price", None))
+                if variant and price is not None:
+                    product = variant.product
+                    emi_starting_price = product.emi_starting_price
+                    if emi_starting_price is not None:
+                        other_prices = ProductVariantUnit.objects.filter(
+                            variant__product=product
+                        ).exclude(pk=getattr(self.instance, "pk", None)).values_list(
+                            "price", flat=True
+                        )
+                        minimum_price = min([price, *other_prices])
+                        if emi_starting_price > minimum_price:
+                            raise serializers.ValidationError(
+                                {
+                                    "price": (
+                                        "This price would make the product's EMI "
+                                        "starting price invalid."
+                                    )
+                                }
+                            )
+                return attrs
+
+        return ProductVariantUnitAdminSerializer
+
+
+class AdminProductImageViewSet(AdminModelViewSet):
+    queryset = ProductImage.objects.select_related("variant__product").all().order_by("id")
+    search_fields = ("variant__product__name",)
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        variant_id = self.request.query_params.get("variant")
+        product_id = self.request.query_params.get("product")
+        if variant_id:
+            queryset = queryset.filter(variant_id=variant_id)
+        if product_id:
+            queryset = queryset.filter(variant__product_id=product_id)
+        return queryset
+
+    def get_serializer_class(self):
+        class ProductImageAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = ProductImage
+                fields = "__all__"
+                read_only_fields = ("id",)
+
+        return ProductImageAdminSerializer
+
+
+class AdminWishlistViewSet(AdminModelViewSet):
+    queryset = Wishlist.objects.select_related(
+        "user", "variant__product", "variant_unit"
+    ).all().order_by("-created_at", "-id")
+    search_fields = ("user__email", "variant__product__name")
+
+    def get_serializer_class(self):
+        class WishlistAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Wishlist
+                fields = "__all__"
+                read_only_fields = ("id", "created_at")
+
+        return WishlistAdminSerializer
+
+
+class AdminCartViewSet(AdminModelViewSet):
+    queryset = Cart.objects.select_related(
+        "user", "variant__product", "variant_unit", "coupon"
+    ).all().order_by("-created_at", "-id")
+    search_fields = ("user__email", "variant__product__name", "coupon__code")
+
+    def get_serializer_class(self):
+        class CartAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Cart
+                fields = "__all__"
+                read_only_fields = ("id", "created_at")
+
+        return CartAdminSerializer
+
+
+class AdminAddressViewSet(AdminModelViewSet):
+    queryset = Address.objects.select_related("user").all().order_by("-created_at")
+    search_fields = ("full_name", "phone", "city", "postal_code", "country", "user__email")
+
+    def get_serializer_class(self):
+        class AddressAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Address
+                fields = "__all__"
+                read_only_fields = ("id", "created_at")
+
+        return AddressAdminSerializer
+
+
+class AdminUserProfileViewSet(AdminModelViewSet):
+    queryset = UserProfile.objects.select_related("user").all().order_by("id")
+    search_fields = ("user__email", "phone", "gender")
+
+    def get_serializer_class(self):
+        class UserProfileAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = UserProfile
+                fields = "__all__"
+                read_only_fields = ("id",)
+
+        return UserProfileAdminSerializer
+
+
+class AdminOrderViewSet(AdminModelViewSet):
+    queryset = Order.objects.select_related("user", "address", "cancelled_by").prefetch_related("items").all()
+    search_fields = ("user__email", "user__first_name", "stripe_session_id")
+    ordering = ("-created_at",)
+
+    def get_serializer_class(self):
+        class OrderAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Order
+                fields = "__all__"
+                read_only_fields = ("id", "created_at", "updated_at")
+
+        return OrderAdminSerializer
+
+
+class AdminOrderItemViewSet(AdminModelViewSet):
+    queryset = OrderItem.objects.select_related(
+        "order", "product", "color", "unit", "variant_unit"
+    ).all().order_by("id")
+    search_fields = ("product__name", "order__id", "order__user__email")
+
+    def get_serializer_class(self):
+        class OrderItemAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = OrderItem
+                fields = "__all__"
+                read_only_fields = ("id",)
+
+        return OrderItemAdminSerializer
+
+
+class AdminHeroBannerViewSet(AdminModelViewSet):
+    queryset = HeroBanner.objects.all().order_by("display_order")
+    search_fields = ("title", "subtitle", "description")
+
+    def get_serializer_class(self):
+        class HeroBannerAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = HeroBanner
+                fields = "__all__"
+                read_only_fields = ("id", "created_at", "updated_at")
+
+        return HeroBannerAdminSerializer
+
+
+class AdminPromoBannerViewSet(AdminModelViewSet):
+    queryset = PromoBanner.objects.all().order_by("id")
+    search_fields = ("link",)
+
+    def get_serializer_class(self):
+        class PromoBannerAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = PromoBanner
+                fields = "__all__"
+                read_only_fields = ("id",)
+
+        return PromoBannerAdminSerializer
+
+
+class AdminHeroSideBannerViewSet(AdminModelViewSet):
+    queryset = HeroSideBanner.objects.all().order_by("id")
+    search_fields = ("link",)
+
+    def get_serializer_class(self):
+        class HeroSideBannerAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = HeroSideBanner
+                fields = "__all__"
+                read_only_fields = ("id",)
+
+        return HeroSideBannerAdminSerializer
+
+
+class AdminCouponViewSet(AdminModelViewSet):
+    queryset = Coupon.objects.prefetch_related("products").all().order_by("-created_at")
+    search_fields = ("code", "products__name")
+
+    def get_serializer_class(self):
+        class CouponAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Coupon
+                fields = "__all__"
+                read_only_fields = ("id", "created_at")
+
+        return CouponAdminSerializer
+
+
+class AdminCouponUsageViewSet(AdminModelViewSet):
+    queryset = CouponUsage.objects.select_related("user", "coupon", "product").all().order_by("-used_at", "-id")
+    search_fields = ("user__email", "coupon__code", "product__name")
+
+    def get_serializer_class(self):
+        class CouponUsageAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = CouponUsage
+                fields = "__all__"
+                read_only_fields = ("id", "used_at")
+
+        return CouponUsageAdminSerializer
+
+
+ADMIN_RESOURCES = (
+    ("users", User, "admin/manage/users/"),
+    ("categories", Category, "admin/manage/categories/"),
+    ("subcategories", SubCategory, "admin/manage/subcategories/"),
+    ("offers", Offer, "admin/manage/offers/"),
+    ("colors", Color, "admin/manage/colors/"),
+    ("unit-types", UnitType, "admin/manage/unit-types/"),
+    ("units", Unit, "admin/manage/units/"),
+    ("regions", Region, "admin/manage/regions/"),
+    ("products", Product, "admin/manage/products/"),
+    ("product-variants", ProductVariant, "admin/manage/product-variants/"),
+    ("product-variant-units", ProductVariantUnit, "admin/manage/product-variant-units/"),
+    ("product-images", ProductImage, "admin/manage/product-images/"),
+    ("wishlists", Wishlist, "admin/manage/wishlists/"),
+    ("carts", Cart, "admin/manage/carts/"),
+    ("addresses", Address, "admin/manage/addresses/"),
+    ("user-profiles", UserProfile, "admin/manage/user-profiles/"),
+    ("orders", Order, "admin/manage/orders/"),
+    ("order-items", OrderItem, "admin/manage/order-items/"),
+    ("hero-banners", HeroBanner, "admin/manage/hero-banners/"),
+    ("promo-banners", PromoBanner, "admin/manage/promo-banners/"),
+    ("hero-side-banners", HeroSideBanner, "admin/manage/hero-side-banners/"),
+    ("coupons", Coupon, "admin/manage/coupons/"),
+    ("coupon-usages", CouponUsage, "admin/manage/coupon-usages/"),
+)
+
+# Fields disabled in the dashboard while retaining their database data.
+SCHEMA_EXCLUDED_FIELDS = {
+    "product-variants": {"regions"},
+}
+
+
+class SuperAdminSchemaView(APIView):
+    permission_classes = (IsSuperAdmin,)
+
+    def get(self, request):
+        resources = []
+        for key, model, endpoint in ADMIN_RESOURCES:
+            fields = []
+            excluded_fields = SCHEMA_EXCLUDED_FIELDS.get(key, set())
+            for field in model._meta.fields:
+                fields.append(
+                    {
+                        "name": field.name,
+                        "type": field.get_internal_type(),
+                        "required": not field.blank
+                        and not field.null
+                        and field.default is NOT_PROVIDED,
+                        "read_only": field.auto_created
+                        or not field.editable
+                        or getattr(field, "auto_now", False)
+                        or getattr(field, "auto_now_add", False),
+                        "related_model": (
+                            field.remote_field.model._meta.label_lower
+                            if field.remote_field
+                            else None
+                        ),
+                        "choices": [
+                            {"value": value, "label": label}
+                            for value, label in (field.choices or [])
+                        ],
+                    }
+                )
+            for field in model._meta.many_to_many:
+                if field.name in excluded_fields:
+                    continue
+                fields.append(
+                    {
+                        "name": field.name,
+                        "type": "ManyToManyField",
+                        "required": False,
+                        "read_only": False,
+                        "related_model": field.remote_field.model._meta.label_lower,
+                        "choices": [],
+                    }
+                )
+            resources.append(
+                {
+                    "key": key,
+                    "model": model._meta.label_lower,
+                    "endpoint": f"/{endpoint}",
+                    "capabilities": ["list", "retrieve", "create", "update", "delete"],
+                    "fields": fields,
+                }
+            )
+        return Response({"resources": resources})
+
+
+class SuperAdminOverviewView(APIView):
+    permission_classes = (IsSuperAdmin,)
+
+    def get(self, request):
+        return Response(
+            {
+                "resources": {
+                    key: model.objects.count() for key, model, _ in ADMIN_RESOURCES
+                },
+                "orders": {
+                    "pending": Order.objects.filter(status="Pending").count(),
+                    "processing": Order.objects.filter(status="Processing").count(),
+                    "shipped": Order.objects.filter(status="Shipped").count(),
+                    "delivered": Order.objects.filter(status="Delivered").count(),
+                    "cancelled": Order.objects.filter(status="Cancelled").count(),
+                },
+            }
+        )

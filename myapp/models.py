@@ -107,11 +107,7 @@ class Unit(models.Model):
 
     unit_type = models.ForeignKey(UnitType, on_delete=models.CASCADE, null=True, blank=True, related_name="units")
     name = models.CharField( max_length=20, unique=True)
-    order = models.PositiveIntegerField(default=0)
 
-    class Meta:
-        ordering = ["order"]
-        
     def __str__(self):
         if self.unit_type:
             return f"{self.name} ({self.unit_type.name})"

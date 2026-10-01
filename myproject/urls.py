@@ -7,9 +7,11 @@ urlpatterns = [
 
     path( "nested_admin/", include( "nested_admin.urls" ) ),
 
-    path( "admin/", admin.site.urls ),
-
     path("",include("myapp.urls")),
+
+    # Keep the dashboard management API's /admin/manage/* routes ahead of
+    # Django Admin's catch-all /admin/ resolver.
+    path( "admin/", admin.site.urls ),
     
     path("payment/", include("payment.urls")),
 

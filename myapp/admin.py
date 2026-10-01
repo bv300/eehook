@@ -61,7 +61,7 @@ class UnitTypeAdmin(admin.ModelAdmin):
 
 @admin.register(Unit)
 class UnitAdmin(admin.ModelAdmin):
-    list_display = ("name", "unit_type", "order")
+    list_display = ("name", "unit_type")
     list_filter = ("unit_type",)
 
 @admin.register(Region)
