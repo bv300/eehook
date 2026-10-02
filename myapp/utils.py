@@ -160,4 +160,24 @@ def get_product_prices(product):
         ),
         "has_offer": has_offer,
         "discount_percentage": discount_percentage,
-    } 
+    }
+from rest_framework.throttling import SimpleRateThrottle
+
+
+class AuthRateThrottle(SimpleRateThrottle):
+    scope = "auth"
+
+    def get_cache_key(self, request, view):
+        return self.cache_format % {
+            "scope": self.scope,
+            "ident": self.get_ident(request),
+        }
+
+
+class SearchRateThrottle(SimpleRateThrottle):
+    scope = "search"
+
+    def get_cache_key(self, request, view):
+        user = getattr(request, "user", None)
+        ident = str(user.pk) if user and user.is_authenticated else self.get_ident(request)
+        return self.cache_format % {"scope": self.scope, "ident": ident}

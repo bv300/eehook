@@ -6,6 +6,7 @@ from django.conf import settings
 from django.db import transaction
 from django.http import HttpResponse
 from django.views.decorators.csrf import csrf_exempt
+import logging
 
 from rest_framework.decorators import (
     api_view,
@@ -30,6 +31,8 @@ from myapp.utils import (
 )
 
 from .services import StripeService
+
+logger = logging.getLogger(__name__)
 
 
 stripe.api_key = settings.STRIPE_SECRET_KEY
@@ -245,18 +248,19 @@ def create_checkout_session(request):
             metadata={
                 "user_id": str(request.user.id),
                 "address_id": str(address.id),
-            }
+            },
+            idempotency_key=(
+                request.META.get("HTTP_IDEMPOTENCY_KEY", "")[:255] or None
+            ),
 
         )
 
-    except Exception as e:
-        print("STRIPE ERROR =", e)
-        import traceback
-        traceback.print_exc()
+    except Exception:
+        logger.exception("Stripe checkout session creation failed", extra={"user_id": request.user.id})
 
         return Response(
             {
-                "message": str(e)
+                "message": "Unable to start payment. Please try again later."
             },
             status=500
         )

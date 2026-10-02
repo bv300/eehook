@@ -1,11 +1,11 @@
 from django.urls import path
 from .import views
-from rest_framework_simplejwt.views import TokenRefreshView
+from .views import ThrottledTokenRefreshView
 
 urlpatterns = [
     path("health/", views.health_check),
     path("register/",views.register),
-    path("token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
+    path("token/refresh/", ThrottledTokenRefreshView.as_view(), name="token_refresh"),
     path("google-login/", views.google_login),
     path("login/",views.login),
     path("logout/", views.logout),

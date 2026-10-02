@@ -13,6 +13,11 @@ class OrderAdminPagination(PageNumberPagination):
     page_size = 20
     page_size_query_param = "page_size"
     max_page_size = 100
+    page_size_query_param = "page_size"
+
+    def get_page_size(self, request):
+        size = super().get_page_size(request)
+        return min(size or self.page_size, self.max_page_size)
 
 
 class OrderListQuerySerializer(serializers.Serializer):

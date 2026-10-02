@@ -13,24 +13,21 @@ class StripeService:
         success_url,
         cancel_url,
         metadata=None,
+        idempotency_key=None,
     ):
 
-        session = stripe.checkout.Session.create(
-
-            payment_method_types=[
+        create_kwargs = {
+            "payment_method_types": [
                 "card"
             ],
-
-            mode="payment",
-
-            line_items=line_items,
-
-            success_url=success_url,
-
-            cancel_url=cancel_url,
-
-            metadata=metadata or {},
-
-        )
+            "mode": "payment",
+            "line_items": line_items,
+            "success_url": success_url,
+            "cancel_url": cancel_url,
+            "metadata": metadata or {},
+        }
+        if idempotency_key:
+            create_kwargs["idempotency_key"] = idempotency_key
+        session = stripe.checkout.Session.create(**create_kwargs)
 
         return session

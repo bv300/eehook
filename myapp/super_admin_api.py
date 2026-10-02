@@ -13,6 +13,8 @@ from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.pagination import PageNumberPagination
+from django.core.exceptions import ValidationError
+from PIL import Image, UnidentifiedImageError
 
 from .models import (
     Address,
@@ -46,7 +48,7 @@ from .permissions import IsSuperAdmin
 class SuperAdminPagination(PageNumberPagination):
     page_size = 25
     page_size_query_param = "page_size"
-    max_page_size = 200
+    max_page_size = 100
 
 
 class AdminUserSerializer(serializers.ModelSerializer):
@@ -168,7 +170,26 @@ class AdminModelViewSet(viewsets.ModelViewSet):
     parser_classes = (JSONParser, FormParser, MultiPartParser)
     filter_backends = (filters.SearchFilter, filters.OrderingFilter)
     search_fields = ()
-    ordering_fields = "__all__"
+    # Never allow clients to turn arbitrary query parameters into ORM
+    # expressions. Individual viewsets opt into fields explicitly.
+    ordering_fields = ()
+
+    def _validate_uploads(self):
+        max_bytes = 5 * 1024 * 1024
+        allowed = {"image/jpeg", "image/png", "image/webp"}
+        for uploaded in self.request.FILES.values():
+            if uploaded.size > max_bytes:
+                raise serializers.ValidationError({"file": "Uploaded images must be 5 MB or smaller."})
+            if getattr(uploaded, "content_type", "") not in allowed:
+                raise serializers.ValidationError({"file": "Only JPEG, PNG, and WebP images are accepted."})
+            try:
+                uploaded.seek(0)
+                with Image.open(uploaded) as image:
+                    image.verify()
+            except (UnidentifiedImageError, OSError):
+                raise serializers.ValidationError({"file": "The uploaded file is not a valid image."})
+            finally:
+                uploaded.seek(0)
 
     def _audit(self, action, instance, description=""):
         AdminAuditLog.objects.create(
@@ -181,10 +202,12 @@ class AdminModelViewSet(viewsets.ModelViewSet):
         )
 
     def perform_create(self, serializer):
+        self._validate_uploads()
         instance = serializer.save()
         self._audit("create", instance)
 
     def perform_update(self, serializer):
+        self._validate_uploads()
         instance = serializer.save()
         self._audit("update", instance)
 

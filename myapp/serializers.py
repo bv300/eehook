@@ -24,6 +24,8 @@ class RegisterSerializer(serializers.ModelSerializer):
 
     def validate(self, data):
 
+        data["email"] = data["email"].strip().lower()
+
         if data["password"] != data["confirm_password"]:
             raise serializers.ValidationError(
                 "Passwords do not match"
@@ -63,7 +65,7 @@ class RegisterSerializer(serializers.ModelSerializer):
 class LoginSerializer(serializers.Serializer):
 
     email = serializers.EmailField()
-    password = serializers.CharField()
+    password = serializers.CharField(write_only=True, trim_whitespace=False, max_length=128)
 
     def validate(self, data):
 
@@ -85,6 +87,7 @@ class ForgotPasswordSerializer(serializers.Serializer):
 
     email = serializers.EmailField()
     def validate(self, data):
+        data["email"] = data["email"].strip().lower()
         try:
             user = User.objects.get( email=data["email"])
 
@@ -97,8 +100,8 @@ class ForgotPasswordSerializer(serializers.Serializer):
 
 class ResetPasswordSerializer( serializers.Serializer):
 
-    password = serializers.CharField()
-    confirm_password = serializers.CharField()
+    password = serializers.CharField(write_only=True, trim_whitespace=False, max_length=128)
+    confirm_password = serializers.CharField(write_only=True, trim_whitespace=False, max_length=128)
     def validate(self, data):
 
         if data["password"] != data["confirm_password"]:
@@ -604,7 +607,13 @@ class OrderItemSerializer(
 
             "quantity",
 
-            "price"
+            "original_price",
+
+            "discount_amount",
+
+            "price",
+
+            "total_price"
 
         ]
 
@@ -733,6 +742,10 @@ class OrderSerializer(
             "postcode",
 
             "country",
+
+            "updated_at",
+
+            "cancelled_at",
 
             "items"
 

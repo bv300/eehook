@@ -12,6 +12,7 @@ from rest_framework.response import Response
 from rest_framework import status
 from django.http import HttpResponse, JsonResponse
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.views import TokenRefreshView
 
 @api_view(["GET"])
 def health_check(request):
@@ -27,7 +28,8 @@ from .permissions import IsSuperAdmin
 
 from rest_framework.decorators import (
     api_view,
-    permission_classes
+    permission_classes,
+    throttle_classes,
 )
 
 from google.oauth2 import id_token
@@ -35,10 +37,18 @@ from google.auth.transport import requests
 
 import csv
 
-import traceback
+import logging
 from google.auth.exceptions import GoogleAuthError
+from .utils import AuthRateThrottle, SearchRateThrottle
+
+logger = logging.getLogger(__name__)
+
+
+class ThrottledTokenRefreshView(TokenRefreshView):
+    throttle_classes = [AuthRateThrottle]
 
 @api_view(["POST"])
+@throttle_classes([AuthRateThrottle])
 def google_login(request):
 
     token = request.data.get("token")
@@ -109,7 +119,7 @@ def google_login(request):
         )
 
     except Exception:
-        traceback.print_exc()   # Terminal-il full error print cheyyum
+        logger.exception("Google authentication provider failure")
 
         return Response(
             {
@@ -119,6 +129,7 @@ def google_login(request):
         )
 
 @api_view(["POST"])
+@throttle_classes([AuthRateThrottle])
 def register(request):
 
     serializer = RegisterSerializer(data=request.data)
@@ -136,6 +147,7 @@ def register(request):
 
 
 @api_view(["POST"])
+@throttle_classes([AuthRateThrottle])
 def login(request):
 
     serializer = LoginSerializer(data=request.data)
@@ -174,7 +186,13 @@ def login(request):
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def logout(request):
-    """JWT logout endpoint; the client discards its access and refresh tokens."""
+    """Revoke the submitted refresh token when token blacklisting is enabled."""
+    refresh = request.data.get("refresh")
+    if refresh:
+        try:
+            RefreshToken(refresh).blacklist()
+        except Exception:
+            return Response({"message": "Invalid refresh token."}, status=400)
     return Response(
         {"message": "Logged out successfully."},
         status=status.HTTP_200_OK,
@@ -182,6 +200,7 @@ def logout(request):
 
 
 @api_view(["POST"])
+@throttle_classes([AuthRateThrottle])
 def forgot_password(request):
 
     serializer = ForgotPasswordSerializer(
@@ -226,10 +245,8 @@ def forgot_password(request):
             }
         )
 
-    return Response(
-        serializer.errors,
-        status=status.HTTP_400_BAD_REQUEST
-    )
+    # Do not disclose whether an account exists.
+    return Response({"message": "If the account exists, a reset email will be sent."}, status=200)
 @api_view(["POST"])
 def reset_password( request,uidb64,token):
 
@@ -295,6 +312,18 @@ def get_products(request):
     subcategory = request.GET.get("subcategory")
     sort = request.GET.get("sort")
 
+    # IDs are parsed as integers before they reach the ORM; ordering is a
+    # closed allow-list and never comes from the request directly.
+    try:
+        category = int(category) if category else None
+        subcategory = int(subcategory) if subcategory else None
+        if category is not None and category < 1 or subcategory is not None and subcategory < 1:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response({"error": "Invalid category or subcategory"}, status=400)
+    if sort not in (None, "", "price_low", "price_high", "new"):
+        return Response({"error": "Invalid sort value"}, status=400)
+
     if category:
         products = products.filter(
             category_id=category
@@ -321,7 +350,7 @@ def get_products(request):
         )
 
     serializer = ProductSerializer(
-        products.distinct(),
+        products.distinct()[:100],
         many=True
     )
 
@@ -1269,6 +1298,7 @@ def offer_status(request):
     })
 
 @api_view(["GET"])
+@throttle_classes([SearchRateThrottle])
 def search_products(request):
 
         search = request.GET.get(
@@ -1295,6 +1325,18 @@ def search_products(request):
         sort = request.GET.get(
             "sort"
         )
+
+        if len(search) > 100:
+            return Response({"error": "Search is too long"}, status=400)
+        if sort not in (None, "", "price_low", "price_high", "new"):
+            return Response({"error": "Invalid sort value"}, status=400)
+        try:
+            category = int(category) if category else None
+            subcategory = int(subcategory) if subcategory else None
+            if category is not None and category < 1 or subcategory is not None and subcategory < 1:
+                raise ValueError
+        except (TypeError, ValueError):
+            return Response({"error": "Invalid category or subcategory"}, status=400)
 
         products = Product.objects.filter(
             is_active=True
@@ -1387,7 +1429,7 @@ def search_products(request):
 
         serializer = ProductSerializer(
 
-            products.distinct(),
+            products.distinct()[:100],
 
             many=True
 
@@ -1723,7 +1765,7 @@ def admin_dashboard_cards(request):
 
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsSuperAdmin])
 def admin_orders(request):
 
     if not request.user.is_staff:
@@ -1840,7 +1882,7 @@ def admin_orders(request):
     )
     
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsSuperAdmin])
 def admin_order_details(request, id):
 
     if not request.user.is_staff:
@@ -1882,7 +1924,7 @@ def admin_order_details(request, id):
 
 
 @api_view(["PUT"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsSuperAdmin])
 def update_order_status(request, id):
 
     if not request.user.is_staff:
@@ -1942,7 +1984,7 @@ def update_order_status(request, id):
     )
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsSuperAdmin])
 def low_stock_products(request):
 
     if not request.user.is_staff:
@@ -2000,7 +2042,7 @@ def low_stock_products(request):
     return Response(data)
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsSuperAdmin])
 def export_orders_csv(request):
 
     if not request.user.is_staff:
@@ -2207,7 +2249,7 @@ def home_categories(request):
 
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsSuperAdmin])
 def admin_order_details(request, id):
 
     if not request.user.is_staff:
@@ -2247,7 +2289,7 @@ def admin_order_details(request, id):
 
 
 @api_view(["PUT"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsSuperAdmin])
 def update_order_status(request, id):
 
     if not request.user.is_staff:
