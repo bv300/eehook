@@ -151,7 +151,8 @@ class ProductImageSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "image",
-            "is_primary"
+            "is_primary",
+            "position",
         ]
 
 class ColorSerializer(serializers.ModelSerializer):
@@ -213,6 +214,7 @@ class ProductVariantUnitSerializer(
         fields = [
             "id",
             "size",
+            "sku",
             "price",
             "discounted_price",
             "discount_amount",
@@ -291,6 +293,7 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "color",
+            "sku",
             "sizes",
             "images",
             "price_type",

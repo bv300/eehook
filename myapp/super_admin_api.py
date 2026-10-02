@@ -6,14 +6,13 @@ including multipart uploads and the nested Product records used by the admin
 inlines.
 """
 
-from django.db.models import Min
 from django.db.models.fields import NOT_PROVIDED
+from django.db import transaction
 from rest_framework import filters, serializers, viewsets
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.pagination import PageNumberPagination
-from django.core.exceptions import ValidationError
 from PIL import Image, UnidentifiedImageError
 
 from .models import (
@@ -43,6 +42,7 @@ from .models import (
     Wishlist,
 )
 from .permissions import IsSuperAdmin
+from .catalog_pricing import get_product_price_values
 
 
 class SuperAdminPagination(PageNumberPagination):
@@ -109,7 +109,27 @@ class AdminProductSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Product
-        fields = "__all__"
+        fields = (
+            "id",
+            "category",
+            "subcategory",
+            "offer",
+            "name",
+            "description",
+            "is_active",
+            "created_at",
+            "updated_at",
+            "key_features",
+            "shipping_fee",
+            "estimated_delivery_time",
+            "seller_name",
+            "warranty_info",
+            "emi_available",
+            "emi_starting_price",
+            "current_viewers_count",
+            "promotional_banner_image",
+            "promotional_banner_link",
+        )
         read_only_fields = ("id", "created_at", "updated_at")
 
     def to_internal_value(self, data):
@@ -147,9 +167,8 @@ class AdminProductSerializer(serializers.ModelSerializer):
             attrs["emi_starting_price"] = None
             return attrs
         if emi_starting_price is not None and self.instance:
-            minimum_price = ProductVariantUnit.objects.filter(
-                variant__product=self.instance
-            ).aggregate(Min("price"))["price__min"]
+            prices = get_product_price_values(self.instance)
+            minimum_price = min(prices) if prices else None
             if minimum_price is not None and emi_starting_price > minimum_price:
                 raise serializers.ValidationError(
                     {
@@ -160,6 +179,158 @@ class AdminProductSerializer(serializers.ModelSerializer):
                     }
                 )
         return attrs
+
+    def create(self, validated_data):
+        instance = Product(**validated_data)
+        instance.full_clean()
+        instance.save()
+        return instance
+
+    def update(self, instance, validated_data):
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class AdminProductVariantSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductVariant
+        fields = ("id", "product", "color", "sku", "price_type", "price", "stock")
+        read_only_fields = ("id",)
+
+    def validate(self, attrs):
+        if "regions" in self.initial_data:
+            raise serializers.ValidationError(
+                {"regions": "Regions are disabled for product variants."}
+            )
+
+        price_type = attrs.get("price_type", getattr(self.instance, "price_type", "single"))
+        price = attrs.get("price", getattr(self.instance, "price", None))
+        if price_type == "single" and price is None:
+            raise serializers.ValidationError(
+                {"price": "A single-price variant requires a price."}
+            )
+        if price_type == "multiple" and price is not None:
+            raise serializers.ValidationError(
+                {"price": "A multiple-price variant must store prices on its units."}
+            )
+
+        product = attrs.get("product", getattr(self.instance, "product", None))
+        color = attrs.get("color", getattr(self.instance, "color", None))
+        if product and color is None:
+            duplicate = ProductVariant.objects.filter(
+                product=product,
+                color__isnull=True,
+            ).exclude(pk=getattr(self.instance, "pk", None)).exists()
+            if duplicate:
+                raise serializers.ValidationError(
+                    {"color": "A product can have only one no-color variant."}
+                )
+        if product and product.emi_starting_price is not None and price is not None:
+            if product.emi_starting_price > price:
+                raise serializers.ValidationError(
+                    {"price": "The variant price cannot be below the product EMI starting price."}
+                )
+        return attrs
+
+    def create(self, validated_data):
+        instance = ProductVariant(**validated_data)
+        instance.full_clean()
+        instance.save()
+        return instance
+
+    def update(self, instance, validated_data):
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class AdminProductVariantUnitSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductVariantUnit
+        fields = ("id", "variant", "unit_type", "unit", "sku", "price", "stock")
+        read_only_fields = ("id",)
+
+    def validate(self, attrs):
+        unit = attrs.get("unit", getattr(self.instance, "unit", None))
+        unit_type = attrs.get("unit_type", getattr(self.instance, "unit_type", None))
+        if unit is None:
+            raise serializers.ValidationError({"unit": "A variant unit requires a unit value."})
+        if unit_type is None:
+            raise serializers.ValidationError({"unit_type": "A variant unit requires a unit type."})
+        if not unit.unit_type_id:
+            raise serializers.ValidationError(
+                {"unit": "The selected unit is not assigned to a unit type."}
+            )
+        if unit.unit_type_id != unit_type.id:
+            raise serializers.ValidationError(
+                {"unit_type": "The selected unit does not belong to this unit type."}
+            )
+
+        variant = attrs.get("variant", getattr(self.instance, "variant", None))
+        price = attrs.get("price", getattr(self.instance, "price", None))
+        if variant and price is not None:
+            product = variant.product
+            if product.emi_starting_price is not None:
+                prices = get_product_price_values(product)
+                prices = [
+                    value for value in prices
+                    if not (
+                        variant.price_type == "multiple"
+                        and value == getattr(self.instance, "price", None)
+                    )
+                ]
+                all_prices = [price, *prices]
+                if all_prices and product.emi_starting_price > min(all_prices):
+                    raise serializers.ValidationError(
+                        {"price": "This price would make the product's EMI starting price invalid."}
+                    )
+        return attrs
+
+    def create(self, validated_data):
+        instance = ProductVariantUnit(**validated_data)
+        instance.full_clean()
+        instance.save()
+        return instance
+
+    def update(self, instance, validated_data):
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.full_clean()
+        instance.save()
+        return instance
+
+
+class AdminProductImageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProductImage
+        fields = ("id", "variant", "image", "is_primary", "position")
+        read_only_fields = ("id",)
+
+    def validate(self, attrs):
+        variant = attrs.get("variant", getattr(self.instance, "variant", None))
+        if variant is None:
+            raise serializers.ValidationError(
+                {"variant": "A product image must belong to a variant."}
+            )
+        return attrs
+
+    def create(self, validated_data):
+        instance = ProductImage(**validated_data)
+        instance.full_clean()
+        instance.save()
+        return instance
+
+    def update(self, instance, validated_data):
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.full_clean()
+        instance.save()
+        return instance
 
 
 class AdminModelViewSet(viewsets.ModelViewSet):
@@ -202,18 +373,21 @@ class AdminModelViewSet(viewsets.ModelViewSet):
         )
 
     def perform_create(self, serializer):
-        self._validate_uploads()
-        instance = serializer.save()
-        self._audit("create", instance)
+        with transaction.atomic():
+            self._validate_uploads()
+            instance = serializer.save()
+            self._audit("create", instance)
 
     def perform_update(self, serializer):
-        self._validate_uploads()
-        instance = serializer.save()
-        self._audit("update", instance)
+        with transaction.atomic():
+            self._validate_uploads()
+            instance = serializer.save()
+            self._audit("update", instance)
 
     def perform_destroy(self, instance):
-        self._audit("delete", instance)
-        instance.delete()
+        with transaction.atomic():
+            self._audit("delete", instance)
+            instance.delete()
 
 
 class AdminUserViewSet(AdminModelViewSet):
@@ -351,24 +525,7 @@ class AdminProductVariantViewSet(AdminModelViewSet):
             queryset = queryset.filter(product_id=product_id)
         return queryset
 
-    def get_serializer_class(self):
-        class ProductVariantAdminSerializer(serializers.ModelSerializer):
-            class Meta:
-                model = ProductVariant
-                # Regions are intentionally disabled for product add/edit.
-                # Keep existing database values intact, but do not expose or
-                # accept this relation through the dashboard management API.
-                fields = ("id", "product", "color", "price_type", "price", "stock")
-                read_only_fields = ("id",)
-
-            def validate(self, attrs):
-                if "regions" in self.initial_data:
-                    raise serializers.ValidationError(
-                        {"regions": "Regions are disabled for product variants."}
-                    )
-                return attrs
-
-        return ProductVariantAdminSerializer
+    serializer_class = AdminProductVariantSerializer
 
 
 class AdminProductVariantUnitViewSet(AdminModelViewSet):
@@ -387,42 +544,13 @@ class AdminProductVariantUnitViewSet(AdminModelViewSet):
             queryset = queryset.filter(variant__product_id=product_id)
         return queryset
 
-    def get_serializer_class(self):
-        class ProductVariantUnitAdminSerializer(serializers.ModelSerializer):
-            class Meta:
-                model = ProductVariantUnit
-                fields = "__all__"
-                read_only_fields = ("id",)
-
-            def validate(self, attrs):
-                variant = attrs.get("variant", getattr(self.instance, "variant", None))
-                price = attrs.get("price", getattr(self.instance, "price", None))
-                if variant and price is not None:
-                    product = variant.product
-                    emi_starting_price = product.emi_starting_price
-                    if emi_starting_price is not None:
-                        other_prices = ProductVariantUnit.objects.filter(
-                            variant__product=product
-                        ).exclude(pk=getattr(self.instance, "pk", None)).values_list(
-                            "price", flat=True
-                        )
-                        minimum_price = min([price, *other_prices])
-                        if emi_starting_price > minimum_price:
-                            raise serializers.ValidationError(
-                                {
-                                    "price": (
-                                        "This price would make the product's EMI "
-                                        "starting price invalid."
-                                    )
-                                }
-                            )
-                return attrs
-
-        return ProductVariantUnitAdminSerializer
+    serializer_class = AdminProductVariantUnitSerializer
 
 
 class AdminProductImageViewSet(AdminModelViewSet):
-    queryset = ProductImage.objects.select_related("variant__product").all().order_by("id")
+    queryset = ProductImage.objects.select_related("variant__product").all().order_by(
+        "variant_id", "position", "id"
+    )
     search_fields = ("variant__product__name",)
 
     def get_queryset(self):
@@ -435,14 +563,7 @@ class AdminProductImageViewSet(AdminModelViewSet):
             queryset = queryset.filter(variant__product_id=product_id)
         return queryset
 
-    def get_serializer_class(self):
-        class ProductImageAdminSerializer(serializers.ModelSerializer):
-            class Meta:
-                model = ProductImage
-                fields = "__all__"
-                read_only_fields = ("id",)
-
-        return ProductImageAdminSerializer
+    serializer_class = AdminProductImageSerializer
 
 
 class AdminWishlistViewSet(AdminModelViewSet):

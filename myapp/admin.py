@@ -1,6 +1,7 @@
 import nested_admin
 from django.contrib import admin
 from django import forms
+from django.db import transaction
 from .models import *
 
 admin.site.site_header = "Order Dashboard"
@@ -73,12 +74,14 @@ class ProductImageInline( nested_admin.NestedTabularInline ):
 
     model = ProductImage
     extra = 1
+    fields = ('image', 'position', 'is_primary')
+    ordering = ('position', 'id')
 
 class ProductVariantSizeInline( nested_admin.NestedTabularInline):
 
     model = ProductVariantUnit
     extra = 1
-    fields = ('unit_type', 'unit', 'price', 'stock')
+    fields = ('unit_type', 'unit', 'sku', 'price', 'stock')
 
 class ProductVariantForm(forms.ModelForm):
     class Meta:
@@ -105,13 +108,24 @@ class ProductAdminForm(forms.ModelForm):
 
     def clean(self):
         cleaned_data = super().clean()
+        category = cleaned_data.get('category')
+        subcategory = cleaned_data.get('subcategory')
+        if category and subcategory and subcategory.category_id != category.id:
+            self.add_error(
+                'subcategory',
+                'The subcategory must belong to the selected category.',
+            )
+
         emi_starting_price = cleaned_data.get('emi_starting_price')
 
         if emi_starting_price is not None:
             if hasattr(self, 'request'):
                 post_data = self.request.POST
                 import re
-                price_keys = [k for k in post_data.keys() if re.search(r'variants-\d+-sizes-\d+-price', k)]
+                price_keys = [
+                    k for k in post_data.keys()
+                    if re.search(r'variants-\d+-(?:price|sizes-\d+-price)', k)
+                ]
                 for k in price_keys:
                     try:
                         price_val = float(post_data[k])
@@ -133,6 +147,12 @@ class ProductAdmin(nested_admin.NestedModelAdmin):
         form = super().get_form(request, obj, **kwargs)
         form.request = request
         return form
+
+    def changeform_view(self, request, object_id=None, form_url='', extra_context=None):
+        # Product, variants, sizes, and images submitted through the nested
+        # admin form must commit or roll back together.
+        with transaction.atomic():
+            return super().changeform_view(request, object_id, form_url, extra_context)
 
     list_display = (
         "name",

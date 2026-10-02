@@ -1,5 +1,9 @@
+from decimal import Decimal
+
 from django.core.mail import send_mail
 from django.conf import settings
+from django.db.models import Case, DecimalField, F, Min, Value, When
+from django.db.models.functions import Coalesce
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.http import (
     urlsafe_base64_encode,
@@ -10,6 +14,7 @@ from django.utils.encoding import force_bytes
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
+from rest_framework.pagination import PageNumberPagination
 from django.http import HttpResponse, JsonResponse
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenRefreshView
@@ -42,6 +47,49 @@ from google.auth.exceptions import GoogleAuthError
 from .utils import AuthRateThrottle, SearchRateThrottle
 
 logger = logging.getLogger(__name__)
+
+
+class PublicProductPagination(PageNumberPagination):
+    page_size = 50
+    page_size_query_param = "page_size"
+    max_page_size = 100
+
+
+def _catalog_price_expression():
+    price_field = DecimalField(max_digits=10, decimal_places=2)
+    return Coalesce(
+        Min(
+            Case(
+                When(variants__price_type="single", then=F("variants__price")),
+                When(
+                    variants__price_type="multiple",
+                    then=F("variants__sizes__price"),
+                ),
+                output_field=price_field,
+            )
+        ),
+        Value(Decimal("0.00")),
+        output_field=price_field,
+    )
+
+
+def _order_public_products(products, sort=None):
+    if sort in ("price_low", "price_high"):
+        products = products.annotate(_catalog_price=_catalog_price_expression())
+        return products.order_by(
+            "_catalog_price" if sort == "price_low" else "-_catalog_price",
+            "-created_at",
+        )
+    if sort == "new":
+        return products.order_by("-created_at")
+    return products.order_by("-created_at")
+
+
+def _paginate_public_products(request, products):
+    paginator = PublicProductPagination()
+    page = paginator.paginate_queryset(products, request)
+    serializer = ProductSerializer(page, many=True, context={"request": request})
+    return paginator.get_paginated_response(serializer.data)
 
 
 class ThrottledTokenRefreshView(TokenRefreshView):
@@ -295,10 +343,7 @@ def get_categories(request):  #NAVBAR IL ULLA CATOGARY DROPDOWN IL
 def category_products( request, category_id ):  #CATOGRY YILE PRODUCTS PAGE IL
 
     products = Product.objects.filter( category_id=category_id, is_active=True )
-
-    serializer = ProductSerializer( products, many=True )
-
-    return Response( serializer.data )
+    return _paginate_public_products(request, products.order_by("-created_at"))
 
 
 @api_view(["GET"])
@@ -334,27 +379,8 @@ def get_products(request):
             subcategory_id=subcategory
         )
 
-    if sort == "price_low":
-        products = products.order_by(
-            "variants__sizes__price"
-        )
-
-    elif sort == "price_high":
-        products = products.order_by(
-            "-variants__sizes__price"
-        )
-
-    elif sort == "new":
-        products = products.order_by(
-            "-created_at"
-        )
-
-    serializer = ProductSerializer(
-        products.distinct()[:100],
-        many=True
-    )
-
-    return Response(serializer.data)   
+    products = _order_public_products(products, sort).distinct()
+    return _paginate_public_products(request, products)
     
     
 @api_view(["GET"])
@@ -456,14 +482,7 @@ def related_products(
         id=pk
     )
 
-    serializer = ProductSerializer(
-        products,
-        many=True
-    )
-
-    return Response(
-        serializer.data
-    )
+    return _paginate_public_products(request, products.order_by("-created_at"))
     
 @api_view(["GET"])
 def new_arrivals(request):
@@ -1408,41 +1427,8 @@ def search_products(request):
                 id__in=latest_ids
             )
 
-        if sort == "price_low":
-
-            products = products.order_by(
-                "variants__sizes__price"
-            )
-
-        elif sort == "price_high":
-
-            products = products.order_by(
-                "-variants__sizes__price"
-            )
-
-        elif sort == "new":
-
-            products = products.order_by(
-                "-created_at"
-            )
-
-        else:
-
-            products = products.order_by(
-                "-created_at"
-            )
-
-        serializer = ProductSerializer(
-
-            products.distinct()[:100],
-
-            many=True
-
-        )
-
-        return Response(
-            serializer.data
-        )
+        products = _order_public_products(products, sort).distinct()
+        return _paginate_public_products(request, products)
     
 from decimal import Decimal
 

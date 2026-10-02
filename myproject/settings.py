@@ -21,12 +21,19 @@ SECRET_KEY = os.getenv("SECRET_KEY", "")
 DEBUG = os.getenv("DEBUG", "False").lower() in ("true", "1", "t")
 
 ALLOWED_HOSTS = [host.strip() for host in os.getenv("ALLOWED_HOSTS", "").split(",") if host.strip()]
-if "*" in ALLOWED_HOSTS and not DEBUG:
-    # Fail closed if a deployment accidentally carries a development
-    # wildcard into production.
-    ALLOWED_HOSTS = []
-if not SECRET_KEY and not DEBUG:
-    raise RuntimeError("SECRET_KEY must be configured when DEBUG=False")
+if not DEBUG:
+    if (
+        len(SECRET_KEY) < 50
+        or len(set(SECRET_KEY)) < 5
+        or SECRET_KEY.startswith("django-insecure-")
+    ):
+        raise RuntimeError(
+            "A strong SECRET_KEY must be configured through the environment when DEBUG=False"
+        )
+    if not ALLOWED_HOSTS or "*" in ALLOWED_HOSTS:
+        raise RuntimeError(
+            "ALLOWED_HOSTS must contain explicit production hosts when DEBUG=False"
+        )
 
 
 # Application definition

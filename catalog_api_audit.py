@@ -5,8 +5,14 @@ records and uploaded files are rolled back/removed after the audit.
 """
 
 import json
+import os
 import tempfile
 from pathlib import Path
+
+import django
+
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "myproject.settings")
+django.setup()
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -359,7 +365,11 @@ def run():
                     multiple_variant_response, 201, "Multiple variant create"
                 )
                 multiple_variant_id = multiple_variant_response.data["id"]
-                test_units = list(Unit.objects.exclude(id=audit_unit_id).order_by("id")[:2])
+                test_units = list(
+                    Unit.objects.exclude(id=audit_unit_id)
+                    .filter(unit_type__isnull=False)
+                    .order_by("id")[:2]
+                )
                 check(len(test_units) == 2, "At least two reusable Units are required")
                 variant_unit_ids = []
                 for price, stock, unit in (("49.00", 6, test_units[0]), ("89.00", 4, test_units[1])):

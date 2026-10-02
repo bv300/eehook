@@ -37,6 +37,11 @@ CATEGORY_IMAGES = {
 }
 
 
+UNIT_TYPE_ALIASES = {
+    "Pack Size": "Pack",
+}
+
+
 SUBCATEGORIES = {
     "Gaming Products": ["Consoles", "Games", "Gaming Accessories"],
     "Smart Watches": ["Men", "Women", "Unisex"],
@@ -403,12 +408,14 @@ PRODUCTS = {
 
 
 def ensure_unit(unit_name, unit_type_name):
+    unit_type_name = UNIT_TYPE_ALIASES.get(unit_type_name, unit_type_name)
     unit_type, _ = UnitType.objects.get_or_create(name=unit_type_name)
-    unit, _ = Unit.objects.get_or_create(
-        name=unit_name,
-        defaults={"unit_type": unit_type},
-    )
-    if unit.unit_type_id != unit_type.id:
+    unit = Unit.objects.filter(unit_type=unit_type, name=unit_name).first()
+    if unit is None:
+        unit = Unit.objects.filter(unit_type__isnull=True, name=unit_name).first()
+    if unit is None:
+        unit = Unit.objects.create(name=unit_name, unit_type=unit_type)
+    elif unit.unit_type_id != unit_type.id:
         unit.unit_type = unit_type
         unit.save(update_fields=["unit_type"])
     return unit

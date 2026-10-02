@@ -2,6 +2,8 @@ from decimal import Decimal
 
 from django.utils import timezone
 
+from .catalog_pricing import get_product_price_values
+
 
 def is_offer_valid(offer):
 
@@ -102,15 +104,7 @@ def calculate_order_total(subtotal):
     
 def get_product_prices(product):
 
-    prices = []
-
-    for variant in product.variants.all():
-        if variant.price_type == "single":
-            if variant.price is not None:
-                prices.append(Decimal(str(variant.price)))
-        else:
-            for size in variant.sizes.all():
-                prices.append(Decimal(str(size.price)))
+    prices = get_product_price_values(product)
 
     if not prices:
 

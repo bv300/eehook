@@ -1,5 +1,6 @@
-from django.db import models
+from django.db import models, transaction
 from django.contrib.auth.models import ( AbstractUser, BaseUserManager)
+from django.core.exceptions import ValidationError
 
 
 class UserManager(BaseUserManager):
@@ -106,7 +107,22 @@ class UnitType(models.Model):
 class Unit(models.Model):
 
     unit_type = models.ForeignKey(UnitType, on_delete=models.CASCADE, null=True, blank=True, related_name="units")
-    name = models.CharField( max_length=20, unique=True)
+    name = models.CharField(max_length=20)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=("unit_type", "name"),
+                name="myapp_unit_type_name_unique",
+            )
+        ]
+
+    def clean(self):
+        super().clean()
+        # Existing untyped units remain readable for backward compatibility,
+        # but every newly-created catalog unit must belong to a type.
+        if self._state.adding and not self.unit_type_id:
+            raise ValidationError({"unit_type": "A unit type is required."})
 
     def __str__(self):
         if self.unit_type:
@@ -146,13 +162,24 @@ class Product(models.Model):
 
     def clean(self):
         super().clean()
-        from django.core.exceptions import ValidationError
-        from django.db.models import Min
+        if self.category_id and self.subcategory_id:
+            if self.subcategory.category_id != self.category_id:
+                raise ValidationError(
+                    {"subcategory": "The subcategory must belong to the selected category."}
+                )
+
+        from .catalog_pricing import get_product_minimum_price
+
         if self.emi_starting_price is not None:
-            if self.pk:
-                min_price = ProductVariantUnit.objects.filter(variant__product=self).aggregate(Min('price'))['price__min']
-                if min_price is not None and self.emi_starting_price > min_price:
-                    raise ValidationError({'emi_starting_price': 'EMI starting price cannot be greater than the product price.'})
+            if not self.emi_available:
+                raise ValidationError(
+                    {"emi_starting_price": "EMI starting price requires EMI to be enabled."}
+                )
+            min_price = get_product_minimum_price(self) if self.pk else None
+            if min_price is not None and self.emi_starting_price > min_price:
+                raise ValidationError(
+                    {"emi_starting_price": "EMI starting price cannot be greater than the product price."}
+                )
 
 class ProductView(models.Model):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="unique_views")
@@ -175,6 +202,7 @@ class ProductVariant(models.Model):
     product = models.ForeignKey( Product, on_delete=models.CASCADE, related_name="variants" )
     color = models.ForeignKey(Color,on_delete=models.CASCADE, null=True, blank=True )
     regions = models.ManyToManyField(Region, blank=True)
+    sku = models.CharField(max_length=100, unique=True, null=True, blank=True)
     
     price_type = models.CharField(max_length=20, choices=PRICE_TYPE_CHOICES, default="single")
     price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, help_text="For single price")
@@ -185,6 +213,25 @@ class ProductVariant(models.Model):
             "product",
             "color"
         )
+
+    def clean(self):
+        super().clean()
+        if self.product_id and self.color_id is None:
+            duplicate = ProductVariant.objects.filter(
+                product_id=self.product_id,
+                color__isnull=True,
+            ).exclude(pk=self.pk).exists()
+            if duplicate:
+                raise ValidationError(
+                    {"color": "A product can have only one no-color variant."}
+                )
+        if self.price_type == "single" and self.price is None:
+            raise ValidationError({"price": "A single-price variant requires a price."})
+        if self.price_type == "multiple" and self.price is not None:
+            raise ValidationError(
+                {"price": "A multiple-price variant must store prices on its units."}
+            )
+
     def __str__(self):
         parts = [self.product.name]
         if self.color:
@@ -203,6 +250,7 @@ class ProductVariantUnit(models.Model):
     variant = models.ForeignKey(ProductVariant,on_delete=models.CASCADE, related_name="sizes" )
     unit_type = models.ForeignKey(UnitType, on_delete=models.SET_NULL, null=True, blank=True, verbose_name="Unit (e.g. GB/KG)")
     unit = models.ForeignKey( Unit,  on_delete=models.CASCADE, null=True, blank=True, verbose_name="Quantity (e.g. 128, 1)")
+    sku = models.CharField(max_length=100, unique=True, null=True, blank=True)
     price = models.DecimalField( max_digits=10,decimal_places=2)
     stock = models.PositiveIntegerField( default=0)
 
@@ -211,6 +259,22 @@ class ProductVariantUnit(models.Model):
             "variant",
             "unit"
         )
+
+    def clean(self):
+        super().clean()
+        if not self.unit_id:
+            raise ValidationError({"unit": "A variant unit requires a unit value."})
+        if not self.unit_type_id:
+            raise ValidationError({"unit_type": "A variant unit requires a unit type."})
+        if not self.unit.unit_type_id:
+            raise ValidationError(
+                {"unit": "The selected unit is not assigned to a unit type."}
+            )
+        if self.unit.unit_type_id != self.unit_type_id:
+            raise ValidationError(
+                {"unit_type": "The selected unit does not belong to this unit type."}
+            )
+
     def __str__(self):
         if self.unit:
             return (
@@ -222,15 +286,63 @@ class ProductVariantUnit(models.Model):
     
 class ProductImage(models.Model):
 
-    variant = models.ForeignKey( ProductVariant, on_delete=models.CASCADE,related_name="images", null=True, blank=True)
+    variant = models.ForeignKey(ProductVariant, on_delete=models.CASCADE, related_name="images")
     image = models.ImageField( upload_to="products/")
     is_primary = models.BooleanField( default=False)
+    position = models.PositiveIntegerField(default=0, db_index=True)
+
+    class Meta:
+        ordering = ("position", "id")
+
+    def clean(self):
+        super().clean()
+        if not self.variant_id:
+            raise ValidationError({"variant": "A product image must belong to a variant."})
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        requested_update_fields = kwargs.get("update_fields")
+        original_primary = self.is_primary
+        with transaction.atomic():
+            if self.variant_id:
+                # Lock the owning variant so two concurrent uploads cannot
+                # both decide that they are the first/primary image.
+                ProductVariant.objects.select_for_update().get(pk=self.variant_id)
+                sibling_images = ProductImage.objects.select_for_update().filter(
+                    variant_id=self.variant_id
+                ).exclude(pk=self.pk)
+                if self.is_primary:
+                    sibling_images.filter(is_primary=True).update(is_primary=False)
+                elif not sibling_images.filter(is_primary=True).exists():
+                    self.is_primary = True
+            if (
+                requested_update_fields is not None
+                and self.is_primary != original_primary
+            ):
+                kwargs["update_fields"] = set(requested_update_fields) | {"is_primary"}
+            return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        with transaction.atomic():
+            replacement = None
+            if self.variant_id and self.is_primary:
+                ProductVariant.objects.select_for_update().get(pk=self.variant_id)
+                replacement = (
+                    ProductImage.objects.select_for_update()
+                    .filter(variant_id=self.variant_id)
+                    .exclude(pk=self.pk)
+                    .order_by("position", "id")
+                    .first()
+                )
+            result = super().delete(*args, **kwargs)
+            if replacement:
+                replacement.is_primary = True
+                replacement.save(update_fields=("is_primary",))
+            return result
 
     def __str__(self):
-        return (
-            f"{self.variant.product.name} - "
-      
-        )
+        product_name = self.variant.product.name if self.variant_id else "Unassigned product"
+        return f"{product_name} - {self.image.name or 'image'}"
 
 class Wishlist(models.Model):
 
