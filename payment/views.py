@@ -23,6 +23,7 @@ from myapp.models import (
     OrderItem,
     ProductVariantUnit,
 )
+from myapp.whatsapp import send_owner_order_notification
 
 from myapp.utils import (
     calculate_offer_price,
@@ -665,6 +666,10 @@ def fulfill_paid_order(session):
             user_id=user_id,
             variant_unit_id=snapshot["variant_unit_id"],
         ).delete()
+
+    transaction.on_commit(
+        lambda order_id=order.id: send_owner_order_notification(order_id)
+    )
 
 
     return order

@@ -933,6 +933,7 @@ def update_cart_quantity(request, id):
     )
 
 from django.db import transaction
+from .whatsapp import send_owner_order_notification
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
@@ -1118,6 +1119,10 @@ def place_order(request):
             item.variant.save()
 
     cart_items.delete()
+
+    transaction.on_commit(
+        lambda order_id=order.id: send_owner_order_notification(order_id)
+    )
 
     return Response(
 
