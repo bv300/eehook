@@ -8,6 +8,8 @@ inlines.
 
 from django.db.models.fields import NOT_PROVIDED
 from django.db import transaction
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from rest_framework import filters, serializers, viewsets
 from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.response import Response
@@ -56,6 +58,7 @@ class AdminUserSerializer(serializers.ModelSerializer):
         write_only=True,
         required=False,
         allow_blank=False,
+        max_length=128,
         style={"input_type": "password"},
     )
 
@@ -75,6 +78,17 @@ class AdminUserSerializer(serializers.ModelSerializer):
             "last_login",
         )
         read_only_fields = ("id", "date_joined", "last_login")
+
+    def validate(self, attrs):
+        password = attrs.get("password")
+        if self.instance is None and not password:
+            raise serializers.ValidationError({"password": "A strong password is required for a new account."})
+        if password:
+            try:
+                validate_password(password, user=self.instance)
+            except DjangoValidationError as error:
+                raise serializers.ValidationError({"password": error.messages})
+        return attrs
 
     def create(self, validated_data):
         password = validated_data.pop("password", None)
@@ -510,7 +524,20 @@ class AdminRegionViewSet(AdminModelViewSet):
 class AdminProductViewSet(AdminModelViewSet):
     queryset = Product.objects.select_related("category", "subcategory", "offer").all()
     serializer_class = AdminProductSerializer
-    search_fields = ("name", "description", "seller_name", "category__name", "subcategory__name")
+    # Product identifiers live on the product's variants in the current
+    # schema: variant SKUs are also the catalog/product codes, while
+    # size/unit SKUs are stored one relationship deeper.  SearchFilter uses
+    # case-insensitive ``icontains`` lookups for these fields and keeps the
+    # standard paginated response unchanged.
+    search_fields = (
+        "name",
+        "description",
+        "seller_name",
+        "category__name",
+        "subcategory__name",
+        "variants__sku",
+        "variants__sizes__sku",
+    )
     ordering = ("-created_at",)
 
 

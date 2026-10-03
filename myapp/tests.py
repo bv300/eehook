@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core import mail
 from PIL import Image
 
 from .admin import ProductAdminForm, ProductVariantForm
@@ -81,6 +82,108 @@ class SecurityBoundaryTests(TestCase):
         )
         self.assertEqual(response.status_code, 429)
         self.assertIn("Retry-After", response)
+
+    def test_login_types_keep_customer_and_super_admin_flows_separate(self):
+        customer = User.objects.create_user(
+            email="customer-login@example.invalid",
+            password="CustomerPass123!",
+            role="Customer",
+        )
+        super_admin = User.objects.create_superuser(
+            email="super-admin-login@example.invalid",
+            password="SuperAdminPass123!",
+        )
+
+        customer_response = self.client.post(
+            "/login/",
+            {"email": customer.email, "password": "CustomerPass123!", "login_type": "customer"},
+            format="json",
+        )
+        self.assertEqual(customer_response.status_code, 200)
+
+        admin_through_customer_response = self.client.post(
+            "/login/",
+            {"email": super_admin.email, "password": "SuperAdminPass123!", "login_type": "customer"},
+            format="json",
+        )
+        self.assertEqual(admin_through_customer_response.status_code, 403)
+
+        customer_through_admin_response = self.client.post(
+            "/login/",
+            {"email": customer.email, "password": "CustomerPass123!", "login_type": "super_admin"},
+            format="json",
+        )
+        self.assertEqual(customer_through_admin_response.status_code, 403)
+
+        super_admin_response = self.client.post(
+            "/login/",
+            {"email": super_admin.email, "password": "SuperAdminPass123!", "login_type": "super_admin"},
+            format="json",
+        )
+        self.assertEqual(super_admin_response.status_code, 200)
+
+    def test_registration_rejects_weak_passwords(self):
+        response = self.client.post(
+            "/register/",
+            {
+                "first_name": "New",
+                "email": "weak-password@example.invalid",
+                "password": "password",
+                "confirm_password": "password",
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("password", response.data)
+
+    @override_settings(
+        EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+        EMAIL_HOST_USER="noreply@example.invalid",
+        SITE_URL="http://localhost:5173",
+    )
+    def test_forgot_password_sends_frontend_reset_link_and_accepts_strong_password(self):
+        user = User.objects.create_user(
+            email="reset-flow@example.invalid",
+            password="ExistingPass123!",
+            role="Customer",
+        )
+
+        forgot_response = self.client.post(
+            "/forgot-password/",
+            {"email": user.email},
+            format="json",
+        )
+        self.assertEqual(forgot_response.status_code, 200)
+        self.assertEqual(len(mail.outbox), 1)
+        reset_link = next(
+            line.strip()
+            for line in mail.outbox[0].body.splitlines()
+            if "/reset-password/" in line
+        )
+        reset_path = reset_link.split("http://localhost:5173", 1)[1]
+
+        reset_response = self.client.post(
+            f"{reset_path}/",
+            {
+                "password": "NewStrongPass123!",
+                "confirm_password": "NewStrongPass123!",
+            },
+            format="json",
+        )
+        self.assertEqual(reset_response.status_code, 200)
+        user.refresh_from_db()
+        self.assertTrue(user.check_password("NewStrongPass123!"))
+
+        weak_reset_response = self.client.post(
+            f"{reset_path}/",
+            {
+                "password": "weakpass",
+                "confirm_password": "weakpass",
+            },
+            format="json",
+        )
+        self.assertEqual(weak_reset_response.status_code, 400)
+        self.assertIn("password", weak_reset_response.data)
 
     @override_settings(GLOBAL_RATE_LIMIT=2, GLOBAL_RATE_WINDOW=60)
     def test_global_request_flood_returns_429(self):
@@ -156,6 +259,48 @@ class ProductWorkflowRegressionTests(TestCase):
         )
         self.assertEqual(response.status_code, 201, response.data)
         return ProductVariant.objects.get(pk=response.data["id"])
+
+    def test_admin_product_search_matches_name_and_skus_case_insensitively(self):
+        name_match = self.create_product("iPhone-compatible charger")
+        self.create_variant(name_match, sku="NAME-MATCH-SKU")
+
+        variant_sku_match = self.create_product("Unrelated product")
+        self.create_variant(variant_sku_match, sku="CAT50-IPHONEX")
+
+        unit_sku_match = self.create_product("Another unrelated product")
+        unit_variant = self.create_variant(
+            unit_sku_match,
+            price_type="multiple",
+            price=None,
+            stock=0,
+        )
+        ProductVariantUnit.objects.create(
+            variant=unit_variant,
+            unit_type=self.storage,
+            unit=self.gb,
+            sku="CAT50-IPHONEX-256GB",
+            price="20.00",
+            stock=1,
+        )
+
+        response = self.client.get(
+            "/admin/manage/products/",
+            {"search": "iphone", "page_size": 20},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(response.data), {"count", "next", "previous", "results"})
+        self.assertEqual(
+            {item["id"] for item in response.data["results"]},
+            {name_match.id, variant_sku_match.id, unit_sku_match.id},
+        )
+
+        empty = self.client.get(
+            "/admin/manage/products/",
+            {"search": "does-not-exist", "page_size": 20},
+        )
+        self.assertEqual(empty.status_code, 200)
+        self.assertEqual(empty.data["count"], 0)
 
     def test_variant_price_type_validation(self):
         product = self.create_product()

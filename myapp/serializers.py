@@ -1,5 +1,7 @@
 from rest_framework import serializers
 from django.contrib.auth import authenticate
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from .models import *
 from .utils import *    
 
@@ -31,10 +33,10 @@ class RegisterSerializer(serializers.ModelSerializer):
                 "Passwords do not match"
             )
 
-        if len(data["password"]) < 8:
-            raise serializers.ValidationError(
-                "Password must be at least 8 characters"
-            )
+        try:
+            validate_password(data["password"])
+        except DjangoValidationError as error:
+            raise serializers.ValidationError({"password": error.messages})
 
         if User.objects.filter(
             email=data["email"]
@@ -107,8 +109,10 @@ class ResetPasswordSerializer( serializers.Serializer):
         if data["password"] != data["confirm_password"]:
             raise serializers.ValidationError("Passwords do not match")
 
-        if len(data["password"]) < 8:
-            raise serializers.ValidationError( "Password must be at least 8 characters" )
+        try:
+            validate_password(data["password"])
+        except DjangoValidationError as error:
+            raise serializers.ValidationError({"password": error.messages})
 
         return data
     

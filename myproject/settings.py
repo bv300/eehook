@@ -118,6 +118,9 @@ AUTH_PASSWORD_VALIDATORS = [
         "NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",
     },
     {
+        "NAME": "myapp.password_policy.StrongPasswordValidator",
+    },
+    {
         "NAME": "django.contrib.auth.password_validation.CommonPasswordValidator",
     },
     {
@@ -253,7 +256,7 @@ ADMIN_LOGIN_WINDOW = int(os.getenv("ADMIN_LOGIN_WINDOW", "900"))
 
 # Frontend URL
 
-SITE_URL = os.getenv("SITE_URL")
+SITE_URL = os.getenv("SITE_URL", "http://localhost:5173").rstrip("/")
 
 
 # Stripe

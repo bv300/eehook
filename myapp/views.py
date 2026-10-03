@@ -100,6 +100,13 @@ class ThrottledTokenRefreshView(TokenRefreshView):
 def google_login(request):
 
     token = request.data.get("token")
+    login_type = request.data.get("login_type", "customer")
+
+    if login_type not in ("customer", "super_admin"):
+        return Response(
+            {"detail": "Invalid login type."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
     if not token:
         return Response(
@@ -137,6 +144,17 @@ def google_login(request):
             user.set_unusable_password()
             user.save()
 
+        if login_type == "customer" and (user.role != "Customer" or user.is_staff or user.is_superuser):
+            return Response(
+                {"detail": "Admin accounts must use the Super Admin login page."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        if login_type == "super_admin" and user.role != "Super Admin":
+            return Response(
+                {"detail": "Only Super Admin accounts can access this login."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         refresh = RefreshToken.for_user(user)
 
         return Response(
@@ -150,7 +168,7 @@ def google_login(request):
                     "is_staff": user.is_staff,
                     "role": user.role,
                     "redirect_to": (
-                        "/order-dashboard"
+                        "/eehook-dashboard"
                         if user.role == "Super Admin"
                         else "/"
                     ),
@@ -203,6 +221,23 @@ def login(request):
     serializer.is_valid(raise_exception=True)
 
     user = serializer.validated_data["user"]
+    login_type = request.data.get("login_type", "customer")
+
+    if login_type not in ("customer", "super_admin"):
+        return Response(
+            {"detail": "Invalid login type."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if login_type == "customer" and (user.role != "Customer" or user.is_staff or user.is_superuser):
+        return Response(
+            {"detail": "Admin accounts must use the Super Admin login page."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if login_type == "super_admin" and user.role != "Super Admin":
+        return Response(
+            {"detail": "Only Super Admin accounts can access this login."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
     refresh = RefreshToken.for_user(user)
 
@@ -217,14 +252,14 @@ def login(request):
                 "is_staff": user.is_staff,
                 "role": user.role,
                 "redirect_to": (
-                    "/order-dashboard"
+                        "/eehook-dashboard"
                     if user.role == "Super Admin"
                     else "/"
                 ),
             },
         "role": user.role,
         "redirect_to": (
-            "/order-dashboard" if user.role == "Super Admin" else "/"
+            "/eehook-dashboard" if user.role == "Super Admin" else "/"
         ),
         },
         status=status.HTTP_200_OK
@@ -2497,7 +2532,8 @@ def validate_coupon(request):
     if not (coupon.is_active and coupon.start_date <= now <= coupon.end_date):
         return Response({'message': 'Coupon is expired or inactive'}, status=status.HTTP_400_BAD_REQUEST)
 
-    if not coupon.products.filter(id=product_id).exists():
+    # An empty product relation means the coupon applies to every product.
+    if coupon.products.exists() and not coupon.products.filter(id=product_id).exists():
         return Response({'message': 'Coupon is not applicable for this product'}, status=status.HTTP_400_BAD_REQUEST)
         
     if CouponUsage.objects.filter(coupon=coupon, user=request.user).exists():
