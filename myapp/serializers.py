@@ -1015,8 +1015,6 @@ class ProductSerializer(serializers.ModelSerializer):
             "estimated_delivery_time",
             "seller_name",
             "warranty_info",
-            "emi_available",
-            "emi_starting_price",
             "current_viewers_count",
             "promotional_banner_image",
             "promotional_banner_link",

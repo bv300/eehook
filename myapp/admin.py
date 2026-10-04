@@ -116,24 +116,6 @@ class ProductAdminForm(forms.ModelForm):
                 'The subcategory must belong to the selected category.',
             )
 
-        emi_starting_price = cleaned_data.get('emi_starting_price')
-
-        if emi_starting_price is not None:
-            if hasattr(self, 'request'):
-                post_data = self.request.POST
-                import re
-                price_keys = [
-                    k for k in post_data.keys()
-                    if re.search(r'variants-\d+-(?:price|sizes-\d+-price)', k)
-                ]
-                for k in price_keys:
-                    try:
-                        price_val = float(post_data[k])
-                        if float(emi_starting_price) > price_val:
-                            self.add_error('emi_starting_price', 'EMI starting price cannot be greater than the product price.')
-                            break
-                    except (ValueError, TypeError):
-                        continue
         return cleaned_data
 
 @admin.register(Product)
@@ -184,10 +166,6 @@ class ProductAdmin(nested_admin.NestedModelAdmin):
 
         ("Sales & Delivery Info",
             {"fields": ("seller_name", "shipping_fee", "estimated_delivery_time", "warranty_info")}
-        ),
-
-        ("EMI Details",
-            {"fields": ("emi_available", "emi_starting_price")}
         ),
 
         ("Promotional & Social",

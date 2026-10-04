@@ -151,8 +151,10 @@ class Product(models.Model):
     estimated_delivery_time = models.CharField(max_length=100, blank=True, null=True)
     seller_name = models.CharField(max_length=200, blank=True, null=True)
     warranty_info = models.CharField(max_length=200, blank=True, null=True)
-    emi_available = models.BooleanField(default=False)
-    emi_starting_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    # Kept in the schema for backwards-compatible migrations, but EMI is
+    # permanently disabled and is no longer exposed through the API/admin.
+    emi_available = models.BooleanField(default=False, editable=False)
+    emi_starting_price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True, editable=False)
     current_viewers_count = models.PositiveIntegerField(default=0)
     promotional_banner_image = models.ImageField(upload_to="promotional_banners/", blank=True, null=True)
     promotional_banner_link = models.URLField(max_length=500, blank=True, null=True)
@@ -170,16 +172,10 @@ class Product(models.Model):
 
         from .catalog_pricing import get_product_minimum_price
 
-        if self.emi_starting_price is not None:
-            if not self.emi_available:
-                raise ValidationError(
-                    {"emi_starting_price": "EMI starting price requires EMI to be enabled."}
-                )
-            min_price = get_product_minimum_price(self) if self.pk else None
-            if min_price is not None and self.emi_starting_price > min_price:
-                raise ValidationError(
-                    {"emi_starting_price": "EMI starting price cannot be greater than the product price."}
-                )
+        # EMI is disabled globally. Normalize legacy/imported values so no
+        # product can accidentally re-enable it.
+        self.emi_available = False
+        self.emi_starting_price = None
 
 class ProductView(models.Model):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="unique_views")

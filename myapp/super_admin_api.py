@@ -111,16 +111,6 @@ class AdminUserSerializer(serializers.ModelSerializer):
 
 
 class AdminProductSerializer(serializers.ModelSerializer):
-    # EMI is currently disabled in the dashboard. Accept both JSON null and
-    # multipart form empty strings, then normalize the value to null.
-    emi_available = serializers.BooleanField(required=False, default=False)
-    emi_starting_price = serializers.DecimalField(
-        max_digits=10,
-        decimal_places=2,
-        required=False,
-        allow_null=True,
-    )
-
     class Meta:
         model = Product
         fields = (
@@ -138,27 +128,11 @@ class AdminProductSerializer(serializers.ModelSerializer):
             "estimated_delivery_time",
             "seller_name",
             "warranty_info",
-            "emi_available",
-            "emi_starting_price",
             "current_viewers_count",
             "promotional_banner_image",
             "promotional_banner_link",
         )
         read_only_fields = ("id", "created_at", "updated_at")
-
-    def to_internal_value(self, data):
-        normalized = data.copy()
-        if normalized.get("emi_starting_price") in ("", None):
-            normalized["emi_starting_price"] = None
-        if str(normalized.get("emi_available", "false")).lower() in (
-            "false",
-            "0",
-            "no",
-            "",
-        ):
-            normalized["emi_available"] = False
-            normalized["emi_starting_price"] = None
-        return super().to_internal_value(normalized)
 
     def validate(self, attrs):
         category = attrs.get("category", getattr(self.instance, "category", None))
@@ -170,28 +144,6 @@ class AdminProductSerializer(serializers.ModelSerializer):
                 {"subcategory": "The subcategory must belong to the selected category."}
             )
 
-        emi_starting_price = attrs.get(
-            "emi_starting_price",
-            getattr(self.instance, "emi_starting_price", None),
-        )
-        if not attrs.get(
-            "emi_available",
-            getattr(self.instance, "emi_available", False),
-        ):
-            attrs["emi_starting_price"] = None
-            return attrs
-        if emi_starting_price is not None and self.instance:
-            prices = get_product_price_values(self.instance)
-            minimum_price = min(prices) if prices else None
-            if minimum_price is not None and emi_starting_price > minimum_price:
-                raise serializers.ValidationError(
-                    {
-                        "emi_starting_price": (
-                            "EMI starting price cannot be greater than the "
-                            "product's lowest variant price."
-                        )
-                    }
-                )
         return attrs
 
     def create(self, validated_data):
@@ -242,11 +194,6 @@ class AdminProductVariantSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(
                     {"color": "A product can have only one no-color variant."}
                 )
-        if product and product.emi_starting_price is not None and price is not None:
-            if product.emi_starting_price > price:
-                raise serializers.ValidationError(
-                    {"price": "The variant price cannot be below the product EMI starting price."}
-                )
         return attrs
 
     def create(self, validated_data):
@@ -289,20 +236,6 @@ class AdminProductVariantUnitSerializer(serializers.ModelSerializer):
         price = attrs.get("price", getattr(self.instance, "price", None))
         if variant and price is not None:
             product = variant.product
-            if product.emi_starting_price is not None:
-                prices = get_product_price_values(product)
-                prices = [
-                    value for value in prices
-                    if not (
-                        variant.price_type == "multiple"
-                        and value == getattr(self.instance, "price", None)
-                    )
-                ]
-                all_prices = [price, *prices]
-                if all_prices and product.emi_starting_price > min(all_prices):
-                    raise serializers.ValidationError(
-                        {"price": "This price would make the product's EMI starting price invalid."}
-                    )
         return attrs
 
     def create(self, validated_data):
