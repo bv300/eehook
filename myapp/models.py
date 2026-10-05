@@ -713,6 +713,37 @@ class CouponUsage(models.Model):
     def __str__(self):
         return f"{self.user.email} - {self.coupon.code} on {self.product}"
 
+
+class CouponApplication(models.Model):
+    """Reserve a coupon as soon as a user applies it to a product."""
+
+    coupon = models.ForeignKey(
+        Coupon,
+        on_delete=models.CASCADE,
+        related_name="applications",
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="coupon_applications",
+    )
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name="coupon_applications",
+    )
+    applied_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ("coupon", "user", "product")
+        indexes = [
+            models.Index(fields=("user", "product")),
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} applied {self.coupon.code} to {self.product}"
+
+
 class SavedCoupon(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name="saved_coupons")
     coupon = models.ForeignKey(Coupon, on_delete=models.CASCADE)

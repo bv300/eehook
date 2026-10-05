@@ -300,3 +300,9 @@ class CouponUsageAdmin(admin.ModelAdmin):
     list_display = ('user', 'coupon', 'product', 'used_at')
     search_fields = ('user__email', 'coupon__code', 'product__name')
     list_filter = ('used_at',)
+
+@admin.register(CouponApplication)
+class CouponApplicationAdmin(admin.ModelAdmin):
+    list_display = ('user', 'coupon', 'product', 'applied_at')
+    search_fields = ('user__email', 'coupon__code', 'product__name')
+    list_filter = ('applied_at',)

@@ -6,8 +6,10 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 from django.test import override_settings
 from django.core.cache import cache
+from django.utils import timezone
 
 from decimal import Decimal
+from datetime import timedelta
 from io import BytesIO
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -22,6 +24,10 @@ from .models import (
     AdminAuditLog,
     Category,
     Color,
+    Coupon,
+    CouponApplication,
+    CouponUsage,
+    Cart,
     Product,
     ProductImage,
     ProductVariant,
@@ -82,6 +88,7 @@ class SecurityBoundaryTests(TestCase):
         )
         self.assertEqual(response.status_code, 429)
         self.assertIn("Retry-After", response)
+
 
     def test_login_types_keep_customer_and_super_admin_flows_separate(self):
         customer = User.objects.create_user(
@@ -191,6 +198,138 @@ class SecurityBoundaryTests(TestCase):
         self.client.get("/products/")
         response = self.client.get("/products/")
         self.assertEqual(response.status_code, 429)
+
+
+class CouponApplicationTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = User.objects.create_user(
+            email="coupon-user@example.invalid",
+            password="CouponPass123!",
+            role="Customer",
+        )
+        self.other_user = User.objects.create_user(
+            email="other-coupon-user@example.invalid",
+            password="CouponPass123!",
+            role="Customer",
+        )
+        category = Category.objects.create(
+            name="Coupon Test Category",
+            image=SimpleUploadedFile("coupon-category.jpg", b"category"),
+        )
+        subcategory = SubCategory.objects.create(
+            category=category,
+            name="Coupon Test Subcategory",
+        )
+        self.product = Product.objects.create(
+            category=category,
+            subcategory=subcategory,
+            name="Coupon Test Product",
+            description="A product for coupon validation tests.",
+        )
+        self.other_product = Product.objects.create(
+            category=category,
+            subcategory=subcategory,
+            name="Other Coupon Test Product",
+            description="Another product for coupon validation tests.",
+        )
+        self.variant = ProductVariant.objects.create(
+            product=self.product,
+            price_type="single",
+            price=Decimal("10.00"),
+            stock=5,
+        )
+        self.other_variant = ProductVariant.objects.create(
+            product=self.other_product,
+            price_type="single",
+            price=Decimal("12.00"),
+            stock=5,
+        )
+        now = timezone.now()
+        self.coupon = Coupon.objects.create(
+            code="ONCEONLY",
+            discount_percentage=10,
+            start_date=now - timedelta(days=1),
+            end_date=now + timedelta(days=1),
+        )
+        self.client.force_authenticate(user=self.user)
+
+    def validate(self, product):
+        return self.client.post(
+            "/validate-coupon/",
+            {"code": self.coupon.code, "product_id": product.id},
+            format="json",
+        )
+
+    def test_coupon_application_requires_authentication(self):
+        self.client.force_authenticate(user=None)
+        response = self.validate(self.product)
+        self.assertIn(response.status_code, (401, 403))
+
+    def test_coupon_application_is_once_per_user_coupon_and_product(self):
+        first = self.validate(self.product)
+        self.assertEqual(first.status_code, 200, first.data)
+
+        second = self.validate(self.product)
+        self.assertEqual(second.status_code, 400, second.data)
+        self.assertEqual(second.data["error_code"], "COUPON_ALREADY_APPLIED")
+        self.assertEqual(
+            CouponApplication.objects.filter(
+                user=self.user,
+                coupon=self.coupon,
+                product=self.product,
+            ).count(),
+            1,
+        )
+
+        other_product = self.validate(self.other_product)
+        self.assertEqual(other_product.status_code, 200, other_product.data)
+        added = self.client.post(
+            "/cart/add/",
+            {"variant": self.other_variant.id, "quantity": 1},
+            format="json",
+        )
+        self.assertEqual(added.status_code, 200, added.data)
+        self.assertEqual(
+            Cart.objects.get(user=self.user, variant=self.other_variant).coupon_id,
+            self.coupon.id,
+        )
+
+        self.client.force_authenticate(user=self.other_user)
+        other_user = self.validate(self.product)
+        self.assertEqual(other_user.status_code, 200, other_user.data)
+
+    def test_variant_independence_is_enforced_by_product_id(self):
+        self.assertEqual(self.validate(self.product).status_code, 200)
+        self.assertEqual(self.validate(self.product).status_code, 400)
+
+    def test_coupon_usage_on_one_product_does_not_block_another_product(self):
+        CouponUsage.objects.create(
+            user=self.user,
+            coupon=self.coupon,
+            product=self.product,
+        )
+
+        used_product = self.validate(self.product)
+        self.assertEqual(used_product.status_code, 400)
+
+        other_product = self.validate(self.other_product)
+        self.assertEqual(other_product.status_code, 200, other_product.data)
+
+    def test_applied_coupon_is_carried_to_cart_without_becoming_reusable(self):
+        self.assertEqual(self.validate(self.product).status_code, 200)
+
+        added = self.client.post(
+            "/cart/add/",
+            {"variant": self.variant.id, "quantity": 1},
+            format="json",
+        )
+        self.assertEqual(added.status_code, 200, added.data)
+        self.assertEqual(
+            Cart.objects.get(user=self.user, variant=self.variant).coupon_id,
+            self.coupon.id,
+        )
+        self.assertEqual(self.validate(self.product).status_code, 400)
 
 
 class ProductWorkflowRegressionTests(TestCase):

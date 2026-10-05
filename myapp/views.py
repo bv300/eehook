@@ -2,6 +2,7 @@ from decimal import Decimal
 
 from django.core.mail import send_mail
 from django.conf import settings
+from django.db import IntegrityError
 from django.db.models import Case, DecimalField, F, Min, Value, When
 from django.db.models.functions import Coalesce
 from django.contrib.auth.tokens import default_token_generator
@@ -739,7 +740,13 @@ def add_to_cart(request):
     saved_coupon = SavedCoupon.objects.filter(user=request.user, product=variant.product).first()
     coupon = saved_coupon.coupon if saved_coupon and saved_coupon.coupon.is_valid else None
 
-    if coupon and CouponUsage.objects.filter(coupon=coupon, user=request.user).exists():
+    # Usage is scoped to the product. Using the same coupon on another
+    # product must remain possible for the same customer.
+    if coupon and CouponUsage.objects.filter(
+        coupon=coupon,
+        user=request.user,
+        product=variant.product,
+    ).exists():
         coupon = None
 
     cart_item, created = Cart.objects.get_or_create(
@@ -2516,12 +2523,23 @@ class CouponViewSet(viewsets.ModelViewSet):
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
+@transaction.atomic
 def validate_coupon(request):
-    code = request.data.get('code')
+    code = str(request.data.get('code') or '').strip()
     product_id = request.data.get('product_id')
 
     if not code or not product_id:
         return Response({'message': 'Coupon code and product_id are required'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        product_id = int(product_id)
+    except (TypeError, ValueError):
+        return Response({'message': 'Invalid product_id'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        product = Product.objects.get(id=product_id, is_active=True)
+    except Product.DoesNotExist:
+        return Response({'message': 'Product not found'}, status=status.HTTP_404_NOT_FOUND)
 
     try:
         coupon = Coupon.objects.get(code=code)
@@ -2533,21 +2551,71 @@ def validate_coupon(request):
         return Response({'message': 'Coupon is expired or inactive'}, status=status.HTTP_400_BAD_REQUEST)
 
     # An empty product relation means the coupon applies to every product.
-    if coupon.products.exists() and not coupon.products.filter(id=product_id).exists():
+    if coupon.products.exists() and not coupon.products.filter(id=product.id).exists():
         return Response({'message': 'Coupon is not applicable for this product'}, status=status.HTTP_400_BAD_REQUEST)
-        
-    if CouponUsage.objects.filter(coupon=coupon, user=request.user).exists():
-        return Response({'message': 'You have already used this coupon'}, status=status.HTTP_400_BAD_REQUEST)
+
+    already_applied = (
+        CouponUsage.objects.filter(
+            coupon=coupon,
+            user=request.user,
+            product=product,
+        ).exists()
+        or CouponApplication.objects.filter(
+            coupon=coupon,
+            user=request.user,
+            product=product,
+        ).exists()
+        or SavedCoupon.objects.filter(
+            coupon=coupon,
+            user=request.user,
+            product=product,
+        ).exists()
+        or Cart.objects.filter(
+            user=request.user,
+            variant__product=product,
+            coupon=coupon,
+        ).exists()
+    )
+    if already_applied:
+        return Response(
+            {
+                'message': 'You have already applied this coupon to this product.',
+                'error_code': 'COUPON_ALREADY_APPLIED',
+                'coupon_id': coupon.id,
+                'product_id': product.id,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # The unique constraint is the backend guard for concurrent requests.
+    # Convert a race into the same warning instead of leaking an IntegrityError.
+    try:
+        with transaction.atomic():
+            CouponApplication.objects.create(
+                coupon=coupon,
+                user=request.user,
+                product=product,
+            )
+    except IntegrityError:
+        return Response(
+            {
+                'message': 'You have already applied this coupon to this product.',
+                'error_code': 'COUPON_ALREADY_APPLIED',
+                'coupon_id': coupon.id,
+                'product_id': product.id,
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
         
     SavedCoupon.objects.update_or_create(
         user=request.user,
-        product_id=product_id,
+        product=product,
         defaults={'coupon': coupon}
     )
     
     Cart.objects.filter(
         user=request.user,
-        variant__product_id=product_id
+        variant__product=product
     ).update(coupon=coupon)
         
     return Response({
