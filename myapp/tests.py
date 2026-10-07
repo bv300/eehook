@@ -23,23 +23,138 @@ from .admin import ProductAdminForm, ProductVariantForm
 from .models import (
     Address,
     AdminAuditLog,
+    Brand,
     Category,
     Color,
     Coupon,
     CouponApplication,
     CouponUsage,
     Cart,
+    Offer,
+
     Order,
     OrderItem,
     Product,
     ProductImage,
     ProductVariant,
     ProductVariantUnit,
+    ProductView,
     SubCategory,
+    TrustBenefit,
     Unit,
     UnitType,
     User,
+    Wishlist,
 )
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class TrustBenefitApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.customer = User.objects.create_user(
+            email="trust-benefit-customer@example.invalid",
+            password="CustomerPass123!",
+            role="Customer",
+        )
+        self.super_admin = User.objects.create_superuser(
+            email="trust-benefit-admin@example.invalid",
+            password="SuperAdminPass123!",
+        )
+
+    def test_management_endpoint_is_super_admin_only(self):
+        self.assertIn(self.client.get("/admin/manage/trust-benefits/").status_code, (401, 403))
+        self.client.force_authenticate(user=self.customer)
+        self.assertEqual(self.client.get("/admin/manage/trust-benefits/").status_code, 403)
+        self.client.force_authenticate(user=self.super_admin)
+        self.assertEqual(self.client.get("/admin/manage/trust-benefits/").status_code, 200)
+        schema = self.client.get("/admin/manage/schema/")
+        self.assertEqual(schema.status_code, 200)
+        self.assertIn("trust-benefits", {resource["key"] for resource in schema.data["resources"]})
+
+    def test_icon_key_is_validated_and_crud_supports_activation(self):
+        self.client.force_authenticate(user=self.super_admin)
+        invalid = self.client.post(
+            "/admin/manage/trust-benefits/",
+            {
+                "key": "unsupported",
+                "title": "Unsupported",
+                "description": "This should not be accepted.",
+                "icon_key": "unsupported",
+                "display_order": 1,
+                "is_active": True,
+            },
+            format="json",
+        )
+        self.assertEqual(invalid.status_code, 400)
+
+        created = self.client.post(
+            "/admin/manage/trust-benefits/",
+            {
+                "key": "secure-payment",
+                "title": "Secure payment",
+                "description": "Payments are processed through Stripe checkout.",
+                "icon_key": "secure-payment",
+                "display_order": 2,
+                "is_active": True,
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.data["icon_key"], "secure-payment")
+        deactivated = self.client.patch(
+            f"/admin/manage/trust-benefits/{created.data['id']}/",
+            {"is_active": False},
+            format="json",
+        )
+        self.assertEqual(deactivated.status_code, 200)
+        self.assertFalse(deactivated.data["is_active"])
+
+    def test_homepage_returns_only_active_benefits_in_display_order(self):
+        later = TrustBenefit.objects.create(
+            key="delivery-information",
+            title="Delivery information",
+            description="Delivery details are shown before checkout.",
+            icon_key="delivery-information",
+            display_order=2,
+        )
+        first = TrustBenefit.objects.create(
+            key="secure-payment",
+            title="Secure payment",
+            description="Payments are processed through Stripe checkout.",
+            icon_key="secure-payment",
+            display_order=1,
+        )
+        TrustBenefit.objects.create(
+            key="easy-returns",
+            title="Easy returns",
+            description="Return information is available before purchase.",
+            icon_key="easy-returns",
+            display_order=3,
+            is_active=False,
+        )
+
+        response = self.client.get("/homepage/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["trust_benefits"],
+            [
+                {
+                    "id": first.id,
+                    "key": "secure-payment",
+                    "title": "Secure payment",
+                    "description": "Payments are processed through Stripe checkout.",
+                    "icon_key": "secure-payment",
+                },
+                {
+                    "id": later.id,
+                    "key": "delivery-information",
+                    "title": "Delivery information",
+                    "description": "Delivery details are shown before checkout.",
+                    "icon_key": "delivery-information",
+                },
+            ],
+        )
 
 
 @override_settings(SECURE_SSL_REDIRECT=False)
@@ -1155,3 +1270,159 @@ class ProductWorkflowRegressionTests(TestCase):
         self.assertTrue(
             Unit.objects.filter(unit_type__name="Storage Capacity", name="1TB").exists()
         )
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class HomepageDiscoveryTests(TestCase):
+    def setUp(self):
+        self.media_dir = TemporaryDirectory(prefix="homepage-tests-")
+        self.media_override = override_settings(MEDIA_ROOT=self.media_dir.name)
+        self.media_override.enable()
+        self.addCleanup(self.media_override.disable)
+        self.addCleanup(self.media_dir.cleanup)
+
+        self.user = User.objects.create_user(
+            email="homepage-user@example.invalid",
+            password="HomepagePass123!",
+        )
+        self.category = Category.objects.create(
+            name="Homepage Electronics",
+            image=self.image_file("homepage-category.jpg", (20, 20, 20)),
+        )
+        self.subcategory = SubCategory.objects.create(
+            category=self.category,
+            name="Homepage Devices",
+        )
+        self.brand = Brand.objects.create(name="Homepage Brand")
+        self.client = APIClient()
+        self.client.force_authenticate(user=self.user)
+
+    @staticmethod
+    def image_file(name, color=(30, 30, 30)):
+        stream = BytesIO()
+        Image.new("RGB", (24, 24), color).save(stream, format="JPEG")
+        return SimpleUploadedFile(name, stream.getvalue(), content_type="image/jpeg")
+
+    def create_product(self, name, price="100.00", stock=10, offer=None, brand=None):
+        product = Product.objects.create(
+            category=self.category,
+            subcategory=self.subcategory,
+            brand=brand,
+            offer=offer,
+            name=name,
+            description="Homepage discovery product.",
+        )
+        variant = ProductVariant.objects.create(
+            product=product,
+            price_type="single",
+            price=price,
+            stock=stock,
+        )
+        ProductImage.objects.create(
+            variant=variant,
+            image=self.image_file(f"{product.id}.jpg"),
+            is_primary=True,
+        )
+        return product, variant
+
+    def create_paid_order_item(self, product, quantity):
+        order = Order.objects.create(
+            user=self.user,
+            payment_status="Paid",
+            status="Delivered",
+            total_amount=Decimal("100.00"),
+        )
+        OrderItem.objects.create(
+            order=order,
+            product=product,
+            quantity=quantity,
+            original_price=Decimal("100.00"),
+            discount_amount=Decimal("0.00"),
+            price=Decimal("100.00"),
+            total_price=Decimal("100.00") * quantity,
+        )
+
+    def test_homepage_uses_real_ranked_sections_and_brand_shop_filter(self):
+        today = timezone.localdate()
+        active_offer = Offer.objects.create(
+            title="Homepage active deal",
+            description="An active homepage deal.",
+            image=self.image_file("active-offer.jpg"),
+            discount_percentage=25,
+            start_date=today - timedelta(days=1),
+            end_date=today + timedelta(days=1),
+        )
+        expired_offer = Offer.objects.create(
+            title="Homepage expired deal",
+            description="An expired homepage deal.",
+            image=self.image_file("expired-offer.jpg"),
+            discount_percentage=90,
+            start_date=today - timedelta(days=4),
+            end_date=today - timedelta(days=2),
+        )
+        trending, trending_variant = self.create_product(
+            "Homepage trending", brand=self.brand
+        )
+        deal, _ = self.create_product(
+            "Homepage active deal product", offer=active_offer
+        )
+        expired, _ = self.create_product(
+            "Homepage expired deal product", offer=expired_offer
+        )
+        bestseller, _ = self.create_product("Homepage best seller")
+        other_seller, _ = self.create_product("Homepage other seller")
+        related, _ = self.create_product("Homepage related product", brand=self.brand)
+
+        ProductView.objects.create(product=trending, user=self.user)
+        Wishlist.objects.create(user=self.user, variant=trending_variant)
+        self.create_paid_order_item(bestseller, 5)
+        self.create_paid_order_item(other_seller, 1)
+
+        response = self.client.get("/homepage/")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertIn(trending.id, [item["id"] for item in response.data["trending_now"]])
+        self.assertEqual(
+            [item["id"] for item in response.data["top_deals"]],
+            [deal.id],
+        )
+        self.assertEqual(response.data["best_sellers"][0]["id"], bestseller.id)
+        self.assertNotIn(expired.id, [item["id"] for item in response.data["top_deals"]])
+        self.assertTrue(response.data["just_for_you"])
+        self.assertNotIn(
+            "current_viewers_count",
+            response.data["trending_now"][0],
+        )
+        self.assertEqual(response.data["shop_by_brand"][0]["slug"], "homepage-brand")
+        self.assertEqual(
+            response.data["shop_by_brand"][0]["product_count"],
+            2,
+        )
+        self.assertEqual(response.data["recently_viewed"][0]["id"], trending.id)
+        for section in (
+            "new_arrivals",
+            "trending_now",
+            "top_deals",
+            "best_sellers",
+            "just_for_you",
+            "recently_viewed",
+        ):
+            self.assertLessEqual(len(response.data[section]), 16)
+
+        shop_response = self.client.get("/products/", {"brand": self.brand.slug})
+        self.assertEqual(shop_response.status_code, 200)
+        self.assertEqual(
+            {item["id"] for item in shop_response.data["results"]},
+            {trending.id, related.id},
+        )
+
+    def test_recently_viewed_is_empty_until_a_real_view_exists(self):
+        empty_client = APIClient()
+        empty_response = empty_client.get("/recently-viewed/")
+        self.assertEqual(empty_response.status_code, 200)
+        self.assertEqual(empty_response.data, [])
+
+        product, _ = self.create_product("Actually viewed product")
+        self.client.get(f"/product/{product.id}/")
+        recent_response = self.client.get("/recently-viewed/")
+        self.assertEqual(recent_response.status_code, 200)
+        self.assertEqual([item["id"] for item in recent_response.data], [product.id])

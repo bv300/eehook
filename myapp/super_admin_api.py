@@ -20,6 +20,7 @@ from PIL import Image, UnidentifiedImageError
 from .models import (
     Address,
     AdminAuditLog,
+    Brand,
     Cart,
     Category,
     Coupon,
@@ -37,6 +38,7 @@ from .models import (
     PromoBanner,
     Region,
     SubCategory,
+    TrustBenefit,
     Unit,
     UnitType,
     User,
@@ -118,6 +120,7 @@ class AdminProductSerializer(serializers.ModelSerializer):
             "id",
             "category",
             "subcategory",
+            "brand",
             "offer",
             "name",
             "description",
@@ -344,6 +347,20 @@ class AdminUserViewSet(AdminModelViewSet):
     search_fields = ("email", "first_name", "last_name", "role")
 
 
+class AdminBrandViewSet(AdminModelViewSet):
+    queryset = Brand.objects.all().order_by("name")
+    search_fields = ("name", "slug")
+
+    def get_serializer_class(self):
+        class BrandAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Brand
+                fields = "__all__"
+                read_only_fields = ("id", "created_at")
+
+        return BrandAdminSerializer
+
+
 class AdminCategoryViewSet(AdminModelViewSet):
     queryset = Category.objects.all().order_by("name")
     serializer_class = serializers.ModelSerializer
@@ -456,7 +473,7 @@ class AdminRegionViewSet(AdminModelViewSet):
 
 
 class AdminProductViewSet(AdminModelViewSet):
-    queryset = Product.objects.select_related("category", "subcategory", "offer").all()
+    queryset = Product.objects.select_related("category", "subcategory", "brand", "offer").all()
     serializer_class = AdminProductSerializer
     # Product identifiers live on the product's variants in the current
     # schema: variant SKUs are also the catalog/product codes, while
@@ -632,6 +649,30 @@ class AdminHeroBannerViewSet(AdminModelViewSet):
         return HeroBannerAdminSerializer
 
 
+class AdminTrustBenefitViewSet(AdminModelViewSet):
+    queryset = TrustBenefit.objects.all().order_by("display_order", "id")
+    search_fields = ("key", "title", "description")
+    ordering_fields = ("display_order", "created_at", "updated_at", "key", "title")
+
+    class TrustBenefitAdminSerializer(serializers.ModelSerializer):
+        class Meta:
+            model = TrustBenefit
+            fields = (
+                "id",
+                "key",
+                "title",
+                "description",
+                "icon_key",
+                "display_order",
+                "is_active",
+                "created_at",
+                "updated_at",
+            )
+            read_only_fields = ("id", "created_at", "updated_at")
+
+    serializer_class = TrustBenefitAdminSerializer
+
+
 class AdminPromoBannerViewSet(AdminModelViewSet):
     queryset = PromoBanner.objects.all().order_by("id")
     search_fields = ("link",)
@@ -713,6 +754,7 @@ class AdminCouponUsageViewSet(AdminModelViewSet):
 
 ADMIN_RESOURCES = (
     ("users", User, "admin/manage/users/"),
+    ("brands", Brand, "admin/manage/brands/"),
     ("categories", Category, "admin/manage/categories/"),
     ("subcategories", SubCategory, "admin/manage/subcategories/"),
     ("offers", Offer, "admin/manage/offers/"),
@@ -731,6 +773,7 @@ ADMIN_RESOURCES = (
     ("orders", Order, "admin/manage/orders/"),
     ("order-items", OrderItem, "admin/manage/order-items/"),
     ("hero-banners", HeroBanner, "admin/manage/hero-banners/"),
+    ("trust-benefits", TrustBenefit, "admin/manage/trust-benefits/"),
     ("promo-banners", PromoBanner, "admin/manage/promo-banners/"),
     ("hero-side-banners", HeroSideBanner, "admin/manage/hero-side-banners/"),
     ("coupons", Coupon, "admin/manage/coupons/"),
