@@ -45,6 +45,7 @@ from .models import (
 )
 from .permissions import IsSuperAdmin
 from .catalog_pricing import get_product_price_values
+from .serializers import CouponSerializer
 
 
 class SuperAdminPagination(PageNumberPagination):
@@ -660,17 +661,40 @@ class AdminHeroSideBannerViewSet(AdminModelViewSet):
 
 
 class AdminCouponViewSet(AdminModelViewSet):
-    queryset = Coupon.objects.prefetch_related("products").all().order_by("-created_at")
-    search_fields = ("code", "products__name")
+    queryset = Coupon.objects.select_related("category").prefetch_related("products").all().order_by("-created_at")
+    search_fields = ("code", "products__name", "category__name")
+    ordering_fields = (
+        "code",
+        "applicability_type",
+        "discount_type",
+        "start_date",
+        "end_date",
+        "is_active",
+        "created_at",
+    )
+
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        applicability = self.request.query_params.get("applicability_type")
+        discount_type = self.request.query_params.get("discount_type")
+        is_active = self.request.query_params.get("is_active")
+        category = self.request.query_params.get("category")
+        product = self.request.query_params.get("product")
+
+        if applicability in dict(Coupon.APPLICABILITY_CHOICES):
+            queryset = queryset.filter(applicability_type=applicability)
+        if discount_type in dict(Coupon.DISCOUNT_TYPE_CHOICES):
+            queryset = queryset.filter(discount_type=discount_type)
+        if is_active in {"true", "false", "1", "0"}:
+            queryset = queryset.filter(is_active=is_active in {"true", "1"})
+        if category and category.isdigit():
+            queryset = queryset.filter(category_id=int(category))
+        if product and product.isdigit():
+            queryset = queryset.filter(products__id=int(product))
+        return queryset.distinct()
 
     def get_serializer_class(self):
-        class CouponAdminSerializer(serializers.ModelSerializer):
-            class Meta:
-                model = Coupon
-                fields = "__all__"
-                read_only_fields = ("id", "created_at")
-
-        return CouponAdminSerializer
+        return CouponSerializer
 
 
 class AdminCouponUsageViewSet(AdminModelViewSet):

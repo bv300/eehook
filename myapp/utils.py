@@ -5,6 +5,85 @@ from django.utils import timezone
 from .catalog_pricing import get_product_price_values
 
 
+def coupon_applies_to_product(coupon, product):
+    """Return whether a coupon may be used for a particular product.
+
+    Product coupons retain the legacy behavior where an empty product
+    relation means all products. New dashboard-created product coupons are
+    validated to have at least one product by the coupon serializer.
+    """
+    if not coupon or not product:
+        return False
+
+    if coupon.applicability_type == "CATEGORY":
+        return bool(coupon.category_id and coupon.category_id == product.category_id)
+
+    products = coupon.products.all()
+    return not products.exists() or products.filter(pk=product.pk).exists()
+
+
+def get_latest_coupon(coupon):
+    """Reload a coupon so pricing never uses a stale ORM instance."""
+    if not coupon:
+        return None
+
+    coupon_id = getattr(coupon, "pk", coupon)
+    if not coupon_id:
+        return None
+
+    from .models import Coupon
+
+    return (
+        Coupon.objects
+        .prefetch_related("products")
+        .filter(pk=coupon_id)
+        .first()
+    )
+
+
+def get_eligible_coupon(coupon, product):
+    """Return the current eligible coupon, or None when it is unusable."""
+    latest = get_latest_coupon(coupon)
+    if latest and latest.is_valid and coupon_applies_to_product(latest, product):
+        return latest
+    return None
+
+
+def is_coupon_valid_for_product(coupon, product):
+    return bool(get_eligible_coupon(coupon, product))
+
+
+def calculate_coupon_discount_amount(price, coupon):
+    """Calculate a bounded, currency-rounded coupon discount for a price."""
+    price = max(Decimal(str(price)), Decimal("0.00"))
+    if not coupon:
+        return Decimal("0.00")
+
+    if coupon.discount_type == "FIXED":
+        requested = coupon.fixed_amount or Decimal("0.00")
+    else:
+        requested = price * (coupon.discount_percentage or Decimal("0.00")) / Decimal("100")
+
+    return min(max(requested, Decimal("0.00")), price).quantize(Decimal("0.01"))
+
+
+def calculate_coupon_price(price, coupon):
+    """Return price after a coupon, never below zero."""
+    price = max(Decimal(str(price)), Decimal("0.00"))
+    discount = calculate_coupon_discount_amount(price, coupon)
+    return (price - discount).quantize(Decimal("0.01"))
+
+
+def calculate_discounted_unit_price(price, offer=None, coupon=None, product=None):
+    """Apply the existing offer and then an eligible coupon to one unit."""
+    price = Decimal(str(price or 0))
+    discounted = calculate_offer_price(price, offer)
+    eligible_coupon = get_eligible_coupon(coupon, product) if product else get_latest_coupon(coupon)
+    if eligible_coupon:
+        discounted = calculate_coupon_price(discounted, eligible_coupon)
+    return max(discounted, Decimal("0.00")).quantize(Decimal("0.01"))
+
+
 def is_offer_valid(offer):
 
     if not offer:

@@ -652,6 +652,28 @@ def remove_wishlist(request, id):
             "message": "Removed from wishlist"
         }
     )
+def _refresh_cart_coupon(cart_item):
+    """Reload and validate a cart coupon, detaching stale coupons."""
+    if not cart_item.coupon_id:
+        return None
+
+    coupon_id = cart_item.coupon_id
+    coupon = get_eligible_coupon(coupon_id, cart_item.variant.product)
+    if coupon:
+        cart_item.coupon = coupon
+        return coupon
+
+    Cart.objects.filter(pk=cart_item.pk, coupon_id=coupon_id).update(coupon=None)
+    SavedCoupon.objects.filter(
+        user=cart_item.user,
+        product=cart_item.variant.product,
+        coupon_id=coupon_id,
+    ).delete()
+    cart_item.coupon = None
+    cart_item.coupon_status = "COUPON_INACTIVE"
+    return None
+
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def add_to_cart(request):
@@ -737,8 +759,33 @@ def add_to_cart(request):
     if quantity > available_stock:
         return Response({"message": f"Only {available_stock} items available in stock"}, status=status.HTTP_400_BAD_REQUEST)
 
-    saved_coupon = SavedCoupon.objects.filter(user=request.user, product=variant.product).first()
-    coupon = saved_coupon.coupon if saved_coupon and saved_coupon.coupon.is_valid else None
+    saved_coupons = SavedCoupon.objects.filter(
+        user=request.user,
+        product=variant.product,
+    ).select_related("coupon", "coupon__category")
+    coupon = None
+    for saved_coupon in saved_coupons:
+        current_coupon = get_eligible_coupon(saved_coupon.coupon_id, variant.product)
+        if current_coupon:
+            coupon = current_coupon
+            break
+        SavedCoupon.objects.filter(pk=saved_coupon.pk).delete()
+
+    # A category coupon is dynamic: once the customer applies it to one
+    # product in a category, it can be carried to other eligible products
+    # added to the cart without creating product targets in the coupon.
+    if coupon is None:
+        category_coupons = SavedCoupon.objects.filter(
+            user=request.user,
+            coupon__applicability_type=Coupon.APPLICABILITY_CATEGORY,
+            coupon__category_id=variant.product.category_id,
+        ).select_related("coupon", "coupon__category")
+        for saved_coupon in category_coupons:
+            current_coupon = get_eligible_coupon(saved_coupon.coupon_id, variant.product)
+            if current_coupon:
+                coupon = current_coupon
+                break
+            SavedCoupon.objects.filter(pk=saved_coupon.pk).delete()
 
     # Usage is scoped to the product. Using the same coupon on another
     # product must remain possible for the same customer.
@@ -778,9 +825,14 @@ def add_to_cart(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
 
+        existing_coupon = _refresh_cart_coupon(cart_item)
+        if coupon is None and existing_coupon:
+            coupon = existing_coupon
         cart_item.quantity = new_quantity
         if coupon:
             cart_item.coupon = coupon
+        elif cart_item.coupon_id:
+            cart_item.coupon = None
         cart_item.save()
 
     return Response(
@@ -814,8 +866,15 @@ def get_cart(request):
         )
     )
 
+    cart_items = list(cart)
+    current_coupons = {
+        item.id: _refresh_cart_coupon(item)
+        for item in cart_items
+        if item.coupon_id
+    }
+
     serializer = CartSerializer(
-        cart,
+        cart_items,
         many=True
     )
 
@@ -823,15 +882,16 @@ def get_cart(request):
 
     total_items = 0
 
-    for item in cart:
+    for item in cart_items:
 
         price = (item.variant.price or 0) if item.variant.price_type == "single" else ((item.variant_unit.price or 0) if item.variant_unit else 0)
         discounted_price = calculate_offer_price(
             price,
             item.variant.product.offer
         )
-        if item.coupon and item.coupon.is_valid:
-            discounted_price = discounted_price - (discounted_price * item.coupon.discount_percentage / 100)
+        coupon = current_coupons.get(item.id)
+        if coupon:
+            discounted_price = calculate_coupon_price(discounted_price, coupon)
 
         subtotal += (
             discounted_price *
@@ -876,6 +936,8 @@ def update_cart_quantity(request, id):
             },
             status=status.HTTP_404_NOT_FOUND
         )
+
+    current_coupon = _refresh_cart_coupon(cart)
 
     try:
 
@@ -930,6 +992,8 @@ def update_cart_quantity(request, id):
         original_price or 0,
         cart.variant.product.offer
     )
+    if current_coupon:
+        discounted_price = calculate_coupon_price(discounted_price, current_coupon)
 
     line_total = (
         discounted_price *
@@ -951,15 +1015,20 @@ def update_cart_quantity(request, id):
 
     for item in cart_items:
 
+        item_coupon = _refresh_cart_coupon(item)
+
         item_price = (
             item.variant.price
             if item.variant.price_type == "single"
             else (item.variant_unit.price if item.variant_unit else 0)
         )
-        subtotal += calculate_offer_price(
+        item_discounted_price = calculate_offer_price(
             item_price or 0,
             item.variant.product.offer,
-        ) * item.quantity
+        )
+        if item_coupon:
+            item_discounted_price = calculate_coupon_price(item_discounted_price, item_coupon)
+        subtotal += item_discounted_price * item.quantity
 
         total_items += item.quantity
 
@@ -983,6 +1052,8 @@ def update_cart_quantity(request, id):
 
             "shipping":
             totals["shipping"],
+
+            "coupon_status": getattr(cart, "coupon_status", None),
 
             "total":
             totals["total"],
@@ -1083,8 +1154,9 @@ def place_order(request):
             original_price,
             item.variant.product.offer
         )
-        if item.coupon and item.coupon.is_valid:
-            discounted_price = discounted_price - (discounted_price * item.coupon.discount_percentage / 100)
+        current_coupon = _refresh_cart_coupon(item)
+        if current_coupon:
+            discounted_price = calculate_coupon_price(discounted_price, current_coupon)
 
         discount_amount = original_price - discounted_price
 
@@ -1134,15 +1206,16 @@ def place_order(request):
             original_price,
             item.variant.product.offer
         )
-        if item.coupon and item.coupon.is_valid:
-            discounted_price = discounted_price - (discounted_price * item.coupon.discount_percentage / 100)
+        current_coupon = _refresh_cart_coupon(item)
+        if current_coupon:
+            discounted_price = calculate_coupon_price(discounted_price, current_coupon)
             
             CouponUsage.objects.get_or_create(
-                coupon=item.coupon,
+                coupon=current_coupon,
                 user=request.user,
                 product=item.variant.product
             )
-            SavedCoupon.objects.filter(user=request.user, coupon=item.coupon, product=item.variant.product).delete()
+            SavedCoupon.objects.filter(user=request.user, coupon=current_coupon, product=item.variant.product).delete()
 
         discount_amount = original_price - discounted_price
 
@@ -2513,13 +2586,13 @@ from rest_framework import viewsets, filters
 from django.utils import timezone
 
 class CouponViewSet(viewsets.ModelViewSet):
-    queryset = Coupon.objects.all()
+    queryset = Coupon.objects.select_related("category").prefetch_related("products").all()
     serializer_class = CouponSerializer
     # Keep the legacy route restricted to the same Super Admin boundary as
     # the dashboard management API.
     permission_classes = [IsSuperAdmin]
     filter_backends = [filters.SearchFilter]
-    search_fields = ['code', 'products__name']
+    search_fields = ['code', 'products__name', 'category__name']
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -2542,16 +2615,27 @@ def validate_coupon(request):
         return Response({'message': 'Product not found'}, status=status.HTTP_404_NOT_FOUND)
 
     try:
-        coupon = Coupon.objects.get(code=code)
+        # Lock and reload the authoritative row so an admin status change
+        # cannot race this application attempt.
+        coupon = Coupon.objects.select_for_update().get(code=code)
     except Coupon.DoesNotExist:
         return Response({'message': 'Invalid coupon code'}, status=status.HTTP_404_NOT_FOUND)
         
     now = timezone.now()
-    if not (coupon.is_active and coupon.start_date <= now <= coupon.end_date):
-        return Response({'message': 'Coupon is expired or inactive'}, status=status.HTTP_400_BAD_REQUEST)
+    if not coupon.is_active or not (coupon.start_date <= now <= coupon.end_date):
+        detail = 'This coupon is no longer active.'
+        return Response(
+            {
+                'error_code': 'COUPON_INACTIVE',
+                'detail': detail,
+                'coupon_code': coupon.code,
+                # Keep the existing frontend message contract as well.
+                'message': 'Coupon is expired or inactive',
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
 
-    # An empty product relation means the coupon applies to every product.
-    if coupon.products.exists() and not coupon.products.filter(id=product.id).exists():
+    if not coupon_applies_to_product(coupon, product):
         return Response({'message': 'Coupon is not applicable for this product'}, status=status.HTTP_400_BAD_REQUEST)
 
     already_applied = (
@@ -2617,9 +2701,21 @@ def validate_coupon(request):
         user=request.user,
         variant__product=product
     ).update(coupon=coupon)
+
+    if coupon.applicability_type == Coupon.APPLICABILITY_CATEGORY:
+        # Apply the category coupon to other currently-carted eligible lines
+        # while leaving an explicitly selected different coupon untouched.
+        Cart.objects.filter(
+            user=request.user,
+            variant__product__category_id=product.category_id,
+            coupon__isnull=True,
+        ).update(coupon=coupon)
         
     return Response({
         'message': 'Coupon applied successfully',
         'discount_percentage': coupon.discount_percentage,
+        'fixed_amount': coupon.fixed_amount,
+        'discount_type': coupon.discount_type,
+        'applicability_type': coupon.applicability_type,
         'coupon_id': coupon.id
     }, status=status.HTTP_200_OK)

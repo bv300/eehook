@@ -30,6 +30,8 @@ class CategoryAdmin(admin.ModelAdmin):
         "created_at"
     )
 
+    search_fields = ("name",)
+
 @admin.register(SubCategory)
 class SubCategoryAdmin(admin.ModelAdmin):
 
@@ -281,10 +283,53 @@ from django.utils.html import format_html
 
 @admin.register(Coupon)
 class CouponAdmin(admin.ModelAdmin):
-    list_display = ('code', 'copy_code_button', 'discount_percentage', 'start_date', 'end_date', 'is_active')
-    search_fields = ('code', 'products__name')
-    autocomplete_fields = ('products',)
-    list_filter = ('is_active', 'start_date', 'end_date')
+    class CouponAdminForm(forms.ModelForm):
+        class Meta:
+            model = Coupon
+            fields = "__all__"
+
+        def clean(self):
+            cleaned = super().clean()
+            applicability = cleaned.get("applicability_type")
+            products = cleaned.get("products")
+            category = cleaned.get("category")
+            if applicability == Coupon.APPLICABILITY_PRODUCT and not products and not self.instance.pk:
+                self.add_error("products", "Select at least one product for a product-wise coupon.")
+            if applicability == Coupon.APPLICABILITY_CATEGORY:
+                if not category:
+                    self.add_error("category", "A category is required for a category-wise coupon.")
+                if products:
+                    self.add_error("products", "Category-wise coupons must not contain product targets.")
+            return cleaned
+
+    form = CouponAdminForm
+    list_display = (
+        "code",
+        "applicability_type",
+        "coupon_target",
+        "discount_type",
+        "discount_value",
+        "start_date",
+        "end_date",
+        "is_active",
+    )
+    search_fields = ('code', 'products__name', 'category__name')
+    autocomplete_fields = ('products', 'category')
+    list_filter = ('applicability_type', 'discount_type', 'is_active', 'start_date', 'end_date')
+
+    def coupon_target(self, obj):
+        if obj.applicability_type == Coupon.APPLICABILITY_CATEGORY:
+            return obj.category.name if obj.category else "-"
+        return ", ".join(obj.products.values_list("name", flat=True)[:3]) or "All products (legacy)"
+
+    coupon_target.short_description = "Target"
+
+    def discount_value(self, obj):
+        if obj.discount_type == Coupon.DISCOUNT_FIXED:
+            return obj.fixed_amount
+        return f"{obj.discount_percentage}%"
+
+    discount_value.short_description = "Discount"
 
     def copy_code_button(self, obj):
         if obj.code:

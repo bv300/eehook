@@ -21,6 +21,7 @@ from PIL import Image
 
 from .admin import ProductAdminForm, ProductVariantForm
 from .models import (
+    Address,
     AdminAuditLog,
     Category,
     Color,
@@ -28,6 +29,8 @@ from .models import (
     CouponApplication,
     CouponUsage,
     Cart,
+    Order,
+    OrderItem,
     Product,
     ProductImage,
     ProductVariant,
@@ -330,6 +333,389 @@ class CouponApplicationTests(TestCase):
             self.coupon.id,
         )
         self.assertEqual(self.validate(self.product).status_code, 400)
+
+
+class CouponEnhancementTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.admin = User.objects.create_superuser(
+            email="coupon-admin@example.invalid",
+            password="CouponAdminPass123!",
+        )
+        self.customer = User.objects.create_user(
+            email="coupon-customer@example.invalid",
+            password="CouponCustomerPass123!",
+            role="Customer",
+        )
+        self.footwear = Category.objects.create(
+            name="Coupon Footwear",
+            image=SimpleUploadedFile("footwear.jpg", b"category"),
+        )
+        self.clothing = Category.objects.create(
+            name="Coupon Clothing",
+            image=SimpleUploadedFile("clothing.jpg", b"category"),
+        )
+        self.footwear_subcategory = SubCategory.objects.create(
+            category=self.footwear,
+            name="Coupon Shoes",
+        )
+        self.clothing_subcategory = SubCategory.objects.create(
+            category=self.clothing,
+            name="Coupon Shirts",
+        )
+        self.shoe = Product.objects.create(
+            category=self.footwear,
+            subcategory=self.footwear_subcategory,
+            name="Coupon Shoe",
+            description="A shoe for coupon tests.",
+        )
+        self.other_shoe = Product.objects.create(
+            category=self.footwear,
+            subcategory=self.footwear_subcategory,
+            name="Other Coupon Shoe",
+            description="Another shoe for coupon tests.",
+        )
+        self.shirt = Product.objects.create(
+            category=self.clothing,
+            subcategory=self.clothing_subcategory,
+            name="Coupon Shirt",
+            description="A shirt for coupon tests.",
+        )
+        self.shoe_variant = ProductVariant.objects.create(
+            product=self.shoe,
+            price_type="single",
+            price="2000.00",
+            stock=5,
+        )
+        self.other_shoe_variant = ProductVariant.objects.create(
+            product=self.other_shoe,
+            price_type="single",
+            price="1000.00",
+            stock=5,
+        )
+        self.shirt_variant = ProductVariant.objects.create(
+            product=self.shirt,
+            price_type="single",
+            price="500.00",
+            stock=5,
+        )
+        self.start = timezone.now() - timedelta(days=1)
+        self.end = timezone.now() + timedelta(days=1)
+
+    def coupon_payload(self, **overrides):
+        payload = {
+            "code": "COUPONTEST",
+            "applicability_type": "CATEGORY",
+            "category": self.footwear.id,
+            "products": [],
+            "discount_type": "PERCENTAGE",
+            "discount_percentage": "10.00",
+            "fixed_amount": None,
+            "start_date": self.start.isoformat(),
+            "end_date": self.end.isoformat(),
+            "is_active": True,
+        }
+        payload.update(overrides)
+        return payload
+
+    def test_admin_accepts_category_percentage_and_product_fixed_coupons(self):
+        self.client.force_authenticate(user=self.admin)
+        category_response = self.client.post(
+            "/admin/manage/coupons/",
+            self.coupon_payload(),
+            format="json",
+        )
+        self.assertEqual(category_response.status_code, 201, category_response.data)
+        category_coupon = Coupon.objects.get(code="COUPONTEST")
+        self.assertEqual(category_coupon.category_id, self.footwear.id)
+        self.assertEqual(category_coupon.discount_percentage, Decimal("10.00"))
+
+        product_response = self.client.post(
+            "/admin/manage/coupons/",
+            self.coupon_payload(
+                code="FIXEDTEST",
+                applicability_type="PRODUCT",
+                category=None,
+                products=[self.shoe.id],
+                discount_type="FIXED",
+                discount_percentage=None,
+                fixed_amount="500.00",
+            ),
+            format="json",
+        )
+        self.assertEqual(product_response.status_code, 201, product_response.data)
+        fixed_coupon = Coupon.objects.get(code="FIXEDTEST")
+        self.assertEqual(fixed_coupon.products.get(), self.shoe)
+        self.assertIsNone(fixed_coupon.discount_percentage)
+        self.assertEqual(fixed_coupon.fixed_amount, Decimal("500.00"))
+
+    def test_admin_rejects_invalid_coupon_combinations(self):
+        self.client.force_authenticate(user=self.admin)
+        for invalid in (
+            {"discount_percentage": "0"},
+            {"discount_percentage": "101"},
+            {"discount_percentage": "-10"},
+            {"applicability_type": "CATEGORY", "category": None},
+            {"applicability_type": "PRODUCT", "category": None, "products": []},
+        ):
+            response = self.client.post(
+                "/admin/manage/coupons/",
+                self.coupon_payload(code=None, **invalid),
+                format="json",
+            )
+            self.assertEqual(response.status_code, 400, response.data)
+
+    def test_category_coupon_is_applied_only_to_eligible_cart_products(self):
+        coupon = Coupon.objects.create(
+            code="FOOTWEAR10",
+            applicability_type=Coupon.APPLICABILITY_CATEGORY,
+            category=self.footwear,
+            discount_type=Coupon.DISCOUNT_PERCENTAGE,
+            discount_percentage=10,
+            start_date=self.start,
+            end_date=self.end,
+        )
+        self.client.force_authenticate(user=self.customer)
+        validated = self.client.post(
+            "/validate-coupon/",
+            {"code": coupon.code, "product_id": self.shoe.id},
+            format="json",
+        )
+        self.assertEqual(validated.status_code, 200, validated.data)
+
+        for variant in (self.shoe_variant, self.other_shoe_variant, self.shirt_variant):
+            response = self.client.post(
+                "/cart/add/",
+                {"variant": variant.id, "quantity": 1},
+                format="json",
+            )
+            self.assertEqual(response.status_code, 200, response.data)
+
+        cart = {
+            item.variant.product.name: item
+            for item in Cart.objects.filter(user=self.customer).select_related("variant__product")
+        }
+        self.assertEqual(cart["Coupon Shoe"].coupon_id, coupon.id)
+        self.assertEqual(cart["Other Coupon Shoe"].coupon_id, coupon.id)
+        self.assertIsNone(cart["Coupon Shirt"].coupon_id)
+
+        response = self.client.get("/cart/")
+        self.assertEqual(response.status_code, 200)
+        prices = {item["product_name"]: Decimal(str(item["discounted_price"])) for item in response.data["items"]}
+        self.assertEqual(prices["Coupon Shoe"], Decimal("1800.00"))
+        self.assertEqual(prices["Other Coupon Shoe"], Decimal("900.00"))
+        self.assertEqual(prices["Coupon Shirt"], Decimal("500.00"))
+
+    def test_fixed_coupon_is_capped_at_the_eligible_price(self):
+        coupon = Coupon.objects.create(
+            code="FIXEDCAP",
+            applicability_type=Coupon.APPLICABILITY_PRODUCT,
+            discount_type=Coupon.DISCOUNT_FIXED,
+            fixed_amount=500,
+            start_date=self.start,
+            end_date=self.end,
+        )
+        coupon.products.add(self.shirt)
+        self.client.force_authenticate(user=self.customer)
+        self.assertEqual(
+            self.client.post(
+                "/validate-coupon/",
+                {"code": coupon.code, "product_id": self.shirt.id},
+                format="json",
+            ).status_code,
+            200,
+        )
+        added = self.client.post(
+            "/cart/add/",
+            {"variant": self.shirt_variant.id, "quantity": 1},
+            format="json",
+        )
+        self.assertEqual(added.status_code, 200, added.data)
+        response = self.client.get("/cart/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["items"][0]["discounted_price"], Decimal("0.00"))
+
+    def create_product_percentage_coupon(self, code="PRODUCT10"):
+        coupon = Coupon.objects.create(
+            code=code,
+            applicability_type=Coupon.APPLICABILITY_PRODUCT,
+            discount_type=Coupon.DISCOUNT_PERCENTAGE,
+            discount_percentage=10,
+            start_date=self.start,
+            end_date=self.end,
+        )
+        coupon.products.add(self.shoe)
+        return coupon
+
+    def test_inactive_coupon_validation_returns_strict_error_contract(self):
+        coupon = self.create_product_percentage_coupon("INACTIVE10")
+        coupon.is_active = False
+        coupon.save()
+        self.client.force_authenticate(user=self.customer)
+
+        response = self.client.post(
+            "/validate-coupon/",
+            {"code": coupon.code, "product_id": self.shoe.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error_code"], "COUPON_INACTIVE")
+        self.assertEqual(response.data["detail"], "This coupon is no longer active.")
+        self.assertEqual(response.data["coupon_code"], coupon.code)
+
+    def test_expired_coupon_is_rejected_by_server(self):
+        coupon = Coupon.objects.create(
+            code="EXPIRED10",
+            applicability_type=Coupon.APPLICABILITY_PRODUCT,
+            discount_type=Coupon.DISCOUNT_PERCENTAGE,
+            discount_percentage=10,
+            start_date=self.start - timedelta(days=3),
+            end_date=self.start - timedelta(days=1),
+        )
+        coupon.products.add(self.shoe)
+        self.client.force_authenticate(user=self.customer)
+
+        response = self.client.post(
+            "/validate-coupon/",
+            {"code": coupon.code, "product_id": self.shoe.id},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.data["error_code"], "COUPON_INACTIVE")
+
+    def test_deactivated_applied_coupon_is_removed_from_cart_and_discount(self):
+        coupon = self.create_product_percentage_coupon("DEACTIVATE10")
+        self.client.force_authenticate(user=self.customer)
+        self.assertEqual(
+            self.client.post(
+                "/validate-coupon/",
+                {"code": coupon.code, "product_id": self.shoe.id},
+                format="json",
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/cart/add/",
+                {"variant": self.shoe_variant.id, "quantity": 1},
+                format="json",
+            ).status_code,
+            200,
+        )
+
+        coupon.is_active = False
+        coupon.save()
+
+        response = self.client.get("/cart/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["items"][0]["discounted_price"], Decimal("2000.00"))
+        self.assertEqual(response.data["items"][0]["coupon_status"], "COUPON_INACTIVE")
+        self.assertIsNone(Cart.objects.get(user=self.customer).coupon_id)
+
+    def test_deactivated_coupon_is_not_attached_when_product_is_added(self):
+        coupon = self.create_product_percentage_coupon("ADDDEACT10")
+        self.client.force_authenticate(user=self.customer)
+        self.assertEqual(
+            self.client.post(
+                "/validate-coupon/",
+                {"code": coupon.code, "product_id": self.shoe.id},
+                format="json",
+            ).status_code,
+            200,
+        )
+        coupon.is_active = False
+        coupon.save()
+
+        response = self.client.post(
+            "/cart/add/",
+            {"variant": self.shoe_variant.id, "quantity": 1},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        cart_item = Cart.objects.get(user=self.customer)
+        self.assertIsNone(cart_item.coupon_id)
+
+    def test_deactivated_coupon_is_not_used_when_order_is_created(self):
+        coupon = self.create_product_percentage_coupon("ORDERDEACT10")
+        self.client.force_authenticate(user=self.customer)
+        self.assertEqual(
+            self.client.post(
+                "/validate-coupon/",
+                {"code": coupon.code, "product_id": self.shoe.id},
+                format="json",
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/cart/add/",
+                {"variant": self.shoe_variant.id, "quantity": 1},
+                format="json",
+            ).status_code,
+            200,
+        )
+        coupon.is_active = False
+        coupon.save()
+        address = Address.objects.create(
+            user=self.customer,
+            full_name="Coupon Customer",
+            address_line="1 Test Street",
+            city="Test City",
+            postal_code="0000",
+        )
+
+        response = self.client.post(
+            "/place-order/",
+            {"address": address.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        order = Order.objects.get(pk=response.data["order_id"])
+        self.assertEqual(order.discount_amount, Decimal("0.00"))
+        self.assertEqual(order.total_amount, Decimal("2015.00"))
+        self.assertEqual(OrderItem.objects.get(order=order).price, Decimal("2000.00"))
+
+    @patch("payment.views.StripeService.create_checkout_session")
+    def test_deactivated_coupon_is_removed_before_payment_session_totals(self, create_session):
+        coupon = self.create_product_percentage_coupon("PAYMENTDEACT10")
+        self.client.force_authenticate(user=self.customer)
+        self.assertEqual(
+            self.client.post(
+                "/validate-coupon/",
+                {"code": coupon.code, "product_id": self.shoe.id},
+                format="json",
+            ).status_code,
+            200,
+        )
+        self.assertEqual(
+            self.client.post(
+                "/cart/add/",
+                {"variant": self.shoe_variant.id, "quantity": 1},
+                format="json",
+            ).status_code,
+            200,
+        )
+        coupon.is_active = False
+        coupon.save()
+        address = Address.objects.create(
+            user=self.customer,
+            full_name="Coupon Customer",
+            address_line="1 Test Street",
+            city="Test City",
+            postal_code="0000",
+        )
+        create_session.return_value.url = "https://stripe.example/checkout"
+
+        response = self.client.post(
+            "/payment/create-checkout-session/",
+            {"address": address.id},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        product_line = create_session.call_args.kwargs["line_items"][0]
+        self.assertEqual(product_line["price_data"]["unit_amount"], 200000)
 
 
 class ProductWorkflowRegressionTests(TestCase):

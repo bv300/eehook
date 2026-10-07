@@ -1,3 +1,5 @@
+from decimal import Decimal
+
 from rest_framework import serializers
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
@@ -381,6 +383,12 @@ class CartSerializer(serializers.ModelSerializer):
 
     discount_percentage = serializers.SerializerMethodField()
 
+    coupon_code = serializers.SerializerMethodField()
+
+    coupon_discount_type = serializers.SerializerMethodField()
+
+    coupon_status = serializers.SerializerMethodField()
+
     quantity = serializers.IntegerField(
         read_only=True
     )
@@ -406,6 +414,9 @@ class CartSerializer(serializers.ModelSerializer):
             "discount_amount",
             "has_offer",
             "discount_percentage",
+            "coupon_code",
+            "coupon_discount_type",
+            "coupon_status",
             "quantity",
             "stock",
             "total_price",
@@ -447,9 +458,10 @@ class CartSerializer(serializers.ModelSerializer):
             price,
             obj.variant.product.offer
         )
-        if getattr(obj, 'coupon', None) and obj.coupon.is_valid:
-            dp = dp - (dp * obj.coupon.discount_percentage / 100)
-        return dp
+        coupon = get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product)
+        if coupon:
+            dp = calculate_coupon_price(dp, coupon)
+        return max(dp, 0).quantize(Decimal("0.01"))
 
     def get_discount_amount(
         self,
@@ -457,14 +469,14 @@ class CartSerializer(serializers.ModelSerializer):
     ):
         price = (obj.variant.price or 0) if obj.variant.price_type == "single" else ((obj.variant_unit.price or 0) if obj.variant_unit else 0)
         dp = self.get_discounted_price(obj)
-        return price - dp
+        return max(price - dp, 0).quantize(Decimal("0.01"))
 
     def get_has_offer(
         self,
         obj
     ):
         has_prod = is_offer_valid(obj.variant.product.offer)
-        has_coup = bool(getattr(obj, 'coupon', None) and obj.coupon.is_valid)
+        has_coup = bool(get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product))
         return has_prod or has_coup
 
     def get_discount_percentage(
@@ -472,8 +484,28 @@ class CartSerializer(serializers.ModelSerializer):
         obj
     ):
         p_pct = obj.variant.product.offer.discount_percentage if is_offer_valid(obj.variant.product.offer) else 0
-        c_pct = obj.coupon.discount_percentage if getattr(obj, 'coupon', None) and obj.coupon.is_valid else 0
+        coupon = get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product)
+        c_pct = coupon.discount_percentage if coupon and coupon.discount_type == "PERCENTAGE" else 0
         return p_pct + c_pct
+
+    def get_coupon_code(self, obj):
+        coupon = get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product)
+        return coupon.code if coupon else None
+
+    def get_coupon_discount_type(self, obj):
+        coupon = get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product)
+        return coupon.discount_type if coupon else None
+
+    def get_coupon_status(self, obj):
+        if getattr(obj, "coupon_status", None):
+            return obj.coupon_status
+        if not getattr(obj, "coupon_id", None):
+            return None
+        return (
+            "ACTIVE"
+            if get_eligible_coupon(obj.coupon_id, obj.variant.product)
+            else "COUPON_INACTIVE"
+        )
 
     def get_total_price(
         self,
@@ -1156,6 +1188,183 @@ class HeroSideBannerSerializer(serializers.ModelSerializer):
         fields = "__all__"
 
 class CouponSerializer(serializers.ModelSerializer):
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    target_name = serializers.SerializerMethodField(read_only=True)
+    discount_value = serializers.SerializerMethodField(read_only=True)
+    applicability_label = serializers.CharField(
+        source="get_applicability_type_display",
+        read_only=True,
+    )
+    discount_type_label = serializers.CharField(
+        source="get_discount_type_display",
+        read_only=True,
+    )
+
     class Meta:
         model = Coupon
-        fields = "__all__"
+        fields = (
+            "id",
+            "code",
+            "products",
+            "category",
+            "category_name",
+            "target_name",
+            "applicability_type",
+            "applicability_label",
+            "discount_type",
+            "discount_type_label",
+            "discount_percentage",
+            "fixed_amount",
+            "discount_value",
+            "start_date",
+            "end_date",
+            "is_active",
+            "created_at",
+        )
+        read_only_fields = (
+            "id",
+            "category_name",
+            "target_name",
+            "applicability_label",
+            "discount_type_label",
+            "discount_value",
+            "created_at",
+        )
+
+    def validate_code(self, value):
+        return value.strip()
+
+    def to_internal_value(self, data):
+        # Keep the canonical model field names while accepting the compact
+        # names commonly used by dashboard forms.
+        data = data.copy()
+        if "apply_to" in data and "applicability_type" not in data:
+            apply_to = str(data["apply_to"]).upper()
+            data["applicability_type"] = {
+                "PRODUCT_WISE": Coupon.APPLICABILITY_PRODUCT,
+                "CATEGORY_WISE": Coupon.APPLICABILITY_CATEGORY,
+            }.get(apply_to, apply_to)
+        if "product" in data and "products" not in data:
+            data["products"] = [data["product"]]
+        if "discount_type" in data:
+            discount_type = str(data["discount_type"]).upper()
+            if discount_type in {"FIXED_AMOUNT", "FIXED AMOUNT"}:
+                data["discount_type"] = Coupon.DISCOUNT_FIXED
+            elif discount_type == "PERCENTAGE_DISCOUNT":
+                data["discount_type"] = Coupon.DISCOUNT_PERCENTAGE
+        if "discount_value" in data:
+            discount_type = str(
+                data.get(
+                    "discount_type",
+                    getattr(self.instance, "discount_type", Coupon.DISCOUNT_PERCENTAGE),
+                )
+            ).upper()
+            value_field = (
+                "fixed_amount"
+                if discount_type in {Coupon.DISCOUNT_FIXED, "FIXED_AMOUNT", "FIXED AMOUNT"}
+                else "discount_percentage"
+            )
+            data.setdefault(value_field, data["discount_value"])
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        instance = self.instance
+        applicability = attrs.get(
+            "applicability_type",
+            getattr(instance, "applicability_type", Coupon.APPLICABILITY_PRODUCT),
+        )
+        category = attrs.get("category", getattr(instance, "category", None))
+        products = attrs.get("products")
+        if products is None and instance is not None:
+            products = list(instance.products.all())
+        products = list(products or [])
+
+        if applicability == Coupon.APPLICABILITY_CATEGORY:
+            if category is None:
+                raise serializers.ValidationError(
+                    {"category": "A category is required for a category-wise coupon."}
+                )
+            if products:
+                raise serializers.ValidationError(
+                    {"products": "Category-wise coupons must not contain product targets."}
+                )
+        elif applicability == Coupon.APPLICABILITY_PRODUCT:
+            if category is not None:
+                raise serializers.ValidationError(
+                    {"category": "Category must be empty for a product-wise coupon."}
+                )
+            # Existing legacy coupons with an empty products relation mean
+            # all products. Keep those records usable on edit, while every
+            # newly-created product-wise coupon must name its target.
+            if not products and instance is None:
+                raise serializers.ValidationError(
+                    {"products": "Select at least one product for a product-wise coupon."}
+                )
+        else:
+            raise serializers.ValidationError(
+                {"applicability_type": "Select Product or Category."}
+            )
+
+        discount_type = attrs.get(
+            "discount_type",
+            getattr(instance, "discount_type", Coupon.DISCOUNT_PERCENTAGE),
+        )
+        percentage = attrs.get(
+            "discount_percentage",
+            getattr(instance, "discount_percentage", None),
+        )
+        fixed_amount = attrs.get(
+            "fixed_amount",
+            getattr(instance, "fixed_amount", None),
+        )
+
+        if discount_type == Coupon.DISCOUNT_PERCENTAGE:
+            if percentage is None or percentage <= 0 or percentage > 100:
+                raise serializers.ValidationError(
+                    {"discount_percentage": "Percentage must be greater than 0 and at most 100."}
+                )
+            attrs["fixed_amount"] = None
+        elif discount_type == Coupon.DISCOUNT_FIXED:
+            if fixed_amount is None or fixed_amount <= 0:
+                raise serializers.ValidationError(
+                    {"fixed_amount": "Fixed amount must be greater than 0."}
+                )
+            attrs["discount_percentage"] = None
+        else:
+            raise serializers.ValidationError(
+                {"discount_type": "Select Percentage or Fixed Amount."}
+            )
+
+        start_date = attrs.get("start_date", getattr(instance, "start_date", None))
+        end_date = attrs.get("end_date", getattr(instance, "end_date", None))
+        if start_date and end_date and start_date >= end_date:
+            raise serializers.ValidationError(
+                {"end_date": "Expiry date must be after the start date."}
+            )
+        return attrs
+
+    def create(self, validated_data):
+        products = validated_data.pop("products", [])
+        instance = Coupon(**validated_data)
+        instance.full_clean()
+        instance.save()
+        instance.products.set(products)
+        return instance
+
+    def update(self, instance, validated_data):
+        products = validated_data.pop("products", None)
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.full_clean()
+        instance.save()
+        if products is not None:
+            instance.products.set(products)
+        return instance
+
+    def get_target_name(self, obj):
+        if obj.applicability_type == Coupon.APPLICABILITY_CATEGORY:
+            return obj.category.name if obj.category else None
+        return list(obj.products.values_list("name", flat=True))
+
+    def get_discount_value(self, obj):
+        return obj.fixed_amount if obj.discount_type == Coupon.DISCOUNT_FIXED else obj.discount_percentage

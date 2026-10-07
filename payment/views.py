@@ -21,14 +21,17 @@ from myapp.models import (
     Address,
     Order,
     OrderItem,
+    ProductVariant,
     ProductVariantUnit,
+    SavedCoupon,
 )
 from myapp.whatsapp import send_owner_order_notification
 
 from myapp.utils import (
     calculate_offer_price,
-    calculate_discount_amount,
     calculate_order_total,
+    calculate_coupon_price,
+    get_eligible_coupon,
 )
 
 from .services import StripeService
@@ -114,33 +117,51 @@ def create_checkout_session(request):
 
     for item in cart_items:
 
-        if item.quantity > item.variant_unit.stock:
+        if item.variant.price_type == "multiple":
+            if not item.variant_unit:
+                return Response(
+                    {"message": f"{item.variant.product.name} has no selectable unit."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            available_stock = item.variant_unit.stock
+            original_price = Decimal(str(item.variant_unit.price))
+        else:
+            available_stock = item.variant.stock
+            original_price = Decimal(str(item.variant.price or 0))
+
+        if item.quantity > available_stock:
 
             return Response(
                 {
                     "message":
                     f"{item.variant.product.name} has only "
-                    f"{item.variant_unit.stock} item(s) left."
+                    f"{available_stock} item(s) left."
                 },
                 status=status.HTTP_400_BAD_REQUEST
             )
-
-
-        original_price = Decimal(
-            str(item.variant_unit.price)
-        )
-
 
         discounted_price = calculate_offer_price(
             original_price,
             item.variant.product.offer
         )
 
+        coupon_id = item.coupon_id
+        coupon = get_eligible_coupon(coupon_id, item.variant.product)
+        if coupon:
+            discounted_price = calculate_coupon_price(discounted_price, coupon)
+        elif coupon_id:
+            Cart.objects.filter(
+                pk=item.pk,
+                coupon_id=coupon_id,
+            ).update(coupon=None)
+            SavedCoupon.objects.filter(
+                user=request.user,
+                product=item.variant.product,
+                coupon_id=coupon_id,
+            ).delete()
+            item.coupon = None
 
-        discount_amount = calculate_discount_amount(
-            original_price,
-            item.variant.product.offer
-        )
+        discount_amount = original_price - discounted_price
 
 
         original_subtotal += (
@@ -171,7 +192,9 @@ def create_checkout_session(request):
                         # after payment, without creating a Pending Order.
                         "metadata": {
                             "type": "product",
-                            "variant_unit_id": str(item.variant_unit_id),
+                            "variant_id": str(item.variant_id),
+                            "variant_unit_id": str(item.variant_unit_id or ""),
+                            "coupon_id": str(coupon.id if coupon else ""),
                             "original_price": str(original_price),
                             "discount_amount": str(discount_amount),
                             "discounted_price": str(discounted_price),
@@ -409,15 +432,11 @@ def fulfill_paid_order(session):
             )
 
 
-        variant_unit_id = metadata.get(
-            "variant_unit_id"
-        )
+        variant_unit_id = metadata.get("variant_unit_id") or None
+        variant_id = metadata.get("variant_id") or None
 
-        if not variant_unit_id:
-
-            raise ValueError(
-                "Variant unit missing from Stripe line item"
-            )
+        if not variant_unit_id and not variant_id:
+            raise ValueError("Product variant missing from Stripe line item")
 
 
         quantity = int(line_item.quantity or 0)
@@ -431,7 +450,9 @@ def fulfill_paid_order(session):
 
         product_snapshots.append(
             {
-                "variant_unit_id": int(variant_unit_id),
+                "variant_unit_id": int(variant_unit_id) if variant_unit_id else None,
+                "variant_id": int(variant_id) if variant_id else None,
+                "coupon_id": int(metadata["coupon_id"]) if metadata.get("coupon_id") else None,
                 "quantity": quantity,
                 "original_price": Decimal(
                     metadata.get("original_price", "0")
@@ -524,6 +545,13 @@ def fulfill_paid_order(session):
     variant_size_ids = [
         snapshot["variant_unit_id"]
         for snapshot in product_snapshots
+        if snapshot["variant_unit_id"] is not None
+    ]
+
+    variant_ids = [
+        snapshot["variant_id"]
+        for snapshot in product_snapshots
+        if snapshot["variant_id"] is not None
     ]
 
 
@@ -544,6 +572,16 @@ def fulfill_paid_order(session):
         )
     }
 
+    locked_variants = {
+        variant.id: variant
+        for variant in (
+            ProductVariant.objects
+            .select_for_update()
+            .select_related("product", "color")
+            .filter(id__in=variant_ids)
+        )
+    }
+
 
     # =====================================================
     # CHECK STOCK AGAIN
@@ -551,23 +589,35 @@ def fulfill_paid_order(session):
 
     for snapshot in product_snapshots:
 
-        variant_unit = locked_sizes.get(
-            snapshot["variant_unit_id"]
-        )
+        variant_unit = locked_sizes.get(snapshot["variant_unit_id"])
+        variant = locked_variants.get(snapshot["variant_id"])
 
-        if not variant_unit:
+        if not variant_unit and not variant:
 
             raise ValueError(
                 "Product variant not found"
             )
 
-
-        if variant_unit.stock < snapshot["quantity"]:
+        stock = variant_unit.stock if variant_unit else variant.stock
+        product_name = variant_unit.variant.product.name if variant_unit else variant.product.name
+        if stock < snapshot["quantity"]:
 
             raise ValueError(
                 f"Insufficient stock for "
-                f"{variant_unit.variant.product.name}"
+                f"{product_name}"
             )
+
+    # A coupon may be deactivated after the Stripe session was created but
+    # before payment fulfillment. Do not create an order from that stale
+    # discounted snapshot.
+    for snapshot in product_snapshots:
+        if not snapshot.get("coupon_id"):
+            continue
+        variant_unit = locked_sizes.get(snapshot["variant_unit_id"])
+        variant = locked_variants.get(snapshot["variant_id"])
+        selected_variant = variant_unit.variant if variant_unit else variant
+        if not get_eligible_coupon(snapshot["coupon_id"], selected_variant.product):
+            raise ValueError("Coupon is no longer active. Please retry checkout.")
 
 
     # =====================================================
@@ -605,19 +655,19 @@ def fulfill_paid_order(session):
 
     for snapshot in product_snapshots:
 
-        variant_unit = locked_sizes[
-            snapshot["variant_unit_id"]
-        ]
+        variant_unit = locked_sizes.get(snapshot["variant_unit_id"])
+        variant = locked_variants.get(snapshot["variant_id"])
+        selected_variant = variant_unit.variant if variant_unit else variant
 
         OrderItem.objects.create(
 
             order=order,
 
-            product=variant_unit.variant.product,
+            product=selected_variant.product,
 
-            color=variant_unit.variant.color,
+            color=selected_variant.color,
 
-            unit=variant_unit.unit,
+            unit=variant_unit.unit if variant_unit else None,
 
             variant_unit=variant_unit,
 
@@ -643,17 +693,11 @@ def fulfill_paid_order(session):
 
     for snapshot in product_snapshots:
 
-        variant_unit = locked_sizes[
-            snapshot["variant_unit_id"]
-        ]
-
-        variant_unit.stock -= snapshot["quantity"]
-
-        variant_unit.save(
-            update_fields=[
-                "stock"
-            ]
-        )
+        variant_unit = locked_sizes.get(snapshot["variant_unit_id"])
+        variant = locked_variants.get(snapshot["variant_id"])
+        stock_record = variant_unit or variant
+        stock_record.stock -= snapshot["quantity"]
+        stock_record.save(update_fields=["stock"])
 
 
     # =====================================================
@@ -662,10 +706,13 @@ def fulfill_paid_order(session):
 
     for snapshot in product_snapshots:
 
-        Cart.objects.filter(
-            user_id=user_id,
-            variant_unit_id=snapshot["variant_unit_id"],
-        ).delete()
+        cart_filter = {"user_id": user_id}
+        if snapshot["variant_unit_id"] is not None:
+            cart_filter["variant_unit_id"] = snapshot["variant_unit_id"]
+        else:
+            cart_filter["variant_id"] = snapshot["variant_id"]
+            cart_filter["variant_unit__isnull"] = True
+        Cart.objects.filter(**cart_filter).delete()
 
     transaction.on_commit(
         lambda order_id=order.id: send_owner_order_notification(order_id)
