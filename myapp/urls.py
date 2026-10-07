@@ -129,6 +129,7 @@ from .super_admin_api import (
     AdminPromoBannerViewSet,
     AdminRegionViewSet,
     AdminSubCategoryViewSet,
+    AdminTrustBenefitViewSet,
     AdminUnitTypeViewSet,
     AdminUnitViewSet,
     AdminUserProfileViewSet,
@@ -159,6 +160,7 @@ router.register(r'admin/manage/user-profiles', AdminUserProfileViewSet, basename
 router.register(r'admin/manage/orders', AdminOrderViewSet, basename='admin-manage-order')
 router.register(r'admin/manage/order-items', AdminOrderItemViewSet, basename='admin-manage-order-item')
 router.register(r'admin/manage/hero-banners', AdminHeroBannerViewSet, basename='admin-manage-hero-banner')
+router.register(r'admin/manage/trust-benefits', AdminTrustBenefitViewSet, basename='admin-manage-trust-benefit')
 router.register(r'admin/manage/promo-banners', AdminPromoBannerViewSet, basename='admin-manage-promo-banner')
 router.register(r'admin/manage/hero-side-banners', AdminHeroSideBannerViewSet, basename='admin-manage-hero-side-banner')
 router.register(r'admin/manage/coupons', AdminCouponViewSet, basename='admin-manage-coupon')

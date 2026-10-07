@@ -688,6 +688,30 @@ class HeroBanner(models.Model):
     def __str__(self):
         return self.title
 
+
+class TrustBenefit(models.Model):
+    ICON_KEY_CHOICES = (
+        ("secure-payment", "Secure payment"),
+        ("delivery-information", "Delivery information"),
+        ("customer-support", "Customer support"),
+        ("easy-returns", "Easy returns"),
+    )
+
+    key = models.SlugField(max_length=100, unique=True)
+    title = models.CharField(max_length=200)
+    description = models.TextField()
+    icon_key = models.CharField(max_length=32, choices=ICON_KEY_CHOICES)
+    display_order = models.PositiveIntegerField(default=1)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("display_order", "id")
+
+    def __str__(self):
+        return self.title
+
 class PromoBanner(models.Model):
 
     image = models.ImageField(upload_to="promo_banners/", help_text='The promotional banner image', null=True, blank=True)

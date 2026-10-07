@@ -854,31 +854,10 @@ def _homepage_brands():
 
 
 def _homepage_trust_benefits():
-    benefits = [
-        {
-            "key": "delivery-information",
-            "title": "Clear delivery information",
-            "description": "Shipping charges and estimated delivery timing are shown before checkout.",
-        }
-    ]
-    if settings.STRIPE_PUBLISHABLE_KEY or settings.STRIPE_SECRET_KEY:
-        benefits.insert(
-            0,
-            {
-                "key": "secure-payment",
-                "title": "Secure payment",
-                "description": "Payments are processed through Stripe checkout.",
-            },
-        )
-    if settings.WHATSAPP_ACCESS_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID:
-        benefits.append(
-            {
-                "key": "customer-support",
-                "title": "Customer support",
-                "description": "Order support is available through the configured support channel.",
-            }
-        )
-    return benefits
+    return HomepageTrustBenefitSerializer(
+        TrustBenefit.objects.filter(is_active=True).order_by("display_order", "id"),
+        many=True,
+    ).data
 
 
 def _homepage_product_data(products, request):

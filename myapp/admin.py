@@ -276,6 +276,15 @@ class HeroBannerAdmin(admin.ModelAdmin):
         "subtitle",
     )
 
+
+@admin.register(TrustBenefit)
+class TrustBenefitAdmin(admin.ModelAdmin):
+    list_display = ("title", "key", "icon_key", "display_order", "is_active", "updated_at")
+    list_filter = ("icon_key", "is_active")
+    ordering = ("display_order", "id")
+    search_fields = ("key", "title", "description")
+
+
 @admin.register(PromoBanner)
 class PromoBannerAdmin(admin.ModelAdmin):
     list_display = ("id", "is_active", "link")

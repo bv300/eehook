@@ -38,11 +38,121 @@ from .models import (
     ProductVariantUnit,
     ProductView,
     SubCategory,
+    TrustBenefit,
     Unit,
     UnitType,
     User,
     Wishlist,
 )
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class TrustBenefitApiTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.customer = User.objects.create_user(
+            email="trust-benefit-customer@example.invalid",
+            password="CustomerPass123!",
+            role="Customer",
+        )
+        self.super_admin = User.objects.create_superuser(
+            email="trust-benefit-admin@example.invalid",
+            password="SuperAdminPass123!",
+        )
+
+    def test_management_endpoint_is_super_admin_only(self):
+        self.assertIn(self.client.get("/admin/manage/trust-benefits/").status_code, (401, 403))
+        self.client.force_authenticate(user=self.customer)
+        self.assertEqual(self.client.get("/admin/manage/trust-benefits/").status_code, 403)
+        self.client.force_authenticate(user=self.super_admin)
+        self.assertEqual(self.client.get("/admin/manage/trust-benefits/").status_code, 200)
+        schema = self.client.get("/admin/manage/schema/")
+        self.assertEqual(schema.status_code, 200)
+        self.assertIn("trust-benefits", {resource["key"] for resource in schema.data["resources"]})
+
+    def test_icon_key_is_validated_and_crud_supports_activation(self):
+        self.client.force_authenticate(user=self.super_admin)
+        invalid = self.client.post(
+            "/admin/manage/trust-benefits/",
+            {
+                "key": "unsupported",
+                "title": "Unsupported",
+                "description": "This should not be accepted.",
+                "icon_key": "unsupported",
+                "display_order": 1,
+                "is_active": True,
+            },
+            format="json",
+        )
+        self.assertEqual(invalid.status_code, 400)
+
+        created = self.client.post(
+            "/admin/manage/trust-benefits/",
+            {
+                "key": "secure-payment",
+                "title": "Secure payment",
+                "description": "Payments are processed through Stripe checkout.",
+                "icon_key": "secure-payment",
+                "display_order": 2,
+                "is_active": True,
+            },
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.data["icon_key"], "secure-payment")
+        deactivated = self.client.patch(
+            f"/admin/manage/trust-benefits/{created.data['id']}/",
+            {"is_active": False},
+            format="json",
+        )
+        self.assertEqual(deactivated.status_code, 200)
+        self.assertFalse(deactivated.data["is_active"])
+
+    def test_homepage_returns_only_active_benefits_in_display_order(self):
+        later = TrustBenefit.objects.create(
+            key="delivery-information",
+            title="Delivery information",
+            description="Delivery details are shown before checkout.",
+            icon_key="delivery-information",
+            display_order=2,
+        )
+        first = TrustBenefit.objects.create(
+            key="secure-payment",
+            title="Secure payment",
+            description="Payments are processed through Stripe checkout.",
+            icon_key="secure-payment",
+            display_order=1,
+        )
+        TrustBenefit.objects.create(
+            key="easy-returns",
+            title="Easy returns",
+            description="Return information is available before purchase.",
+            icon_key="easy-returns",
+            display_order=3,
+            is_active=False,
+        )
+
+        response = self.client.get("/homepage/")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.data["trust_benefits"],
+            [
+                {
+                    "id": first.id,
+                    "key": "secure-payment",
+                    "title": "Secure payment",
+                    "description": "Payments are processed through Stripe checkout.",
+                    "icon_key": "secure-payment",
+                },
+                {
+                    "id": later.id,
+                    "key": "delivery-information",
+                    "title": "Delivery information",
+                    "description": "Delivery details are shown before checkout.",
+                    "icon_key": "delivery-information",
+                },
+            ],
+        )
 
 
 @override_settings(SECURE_SSL_REDIRECT=False)

@@ -1218,6 +1218,12 @@ class HomepageBrandSerializer(serializers.ModelSerializer):
         fields = ["id", "name", "slug", "logo", "product_count"]
 
 
+class HomepageTrustBenefitSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TrustBenefit
+        fields = ["id", "key", "title", "description", "icon_key"]
+
+
 
 class WishlistProductSerializer(
     serializers.Serializer

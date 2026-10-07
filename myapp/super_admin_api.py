@@ -38,6 +38,7 @@ from .models import (
     PromoBanner,
     Region,
     SubCategory,
+    TrustBenefit,
     Unit,
     UnitType,
     User,
@@ -647,6 +648,30 @@ class AdminHeroBannerViewSet(AdminModelViewSet):
         return HeroBannerAdminSerializer
 
 
+class AdminTrustBenefitViewSet(AdminModelViewSet):
+    queryset = TrustBenefit.objects.all().order_by("display_order", "id")
+    search_fields = ("key", "title", "description")
+    ordering_fields = ("display_order", "created_at", "updated_at", "key", "title")
+
+    class TrustBenefitAdminSerializer(serializers.ModelSerializer):
+        class Meta:
+            model = TrustBenefit
+            fields = (
+                "id",
+                "key",
+                "title",
+                "description",
+                "icon_key",
+                "display_order",
+                "is_active",
+                "created_at",
+                "updated_at",
+            )
+            read_only_fields = ("id", "created_at", "updated_at")
+
+    serializer_class = TrustBenefitAdminSerializer
+
+
 class AdminPromoBannerViewSet(AdminModelViewSet):
     queryset = PromoBanner.objects.all().order_by("id")
     search_fields = ("link",)
@@ -724,6 +749,7 @@ ADMIN_RESOURCES = (
     ("orders", Order, "admin/manage/orders/"),
     ("order-items", OrderItem, "admin/manage/order-items/"),
     ("hero-banners", HeroBanner, "admin/manage/hero-banners/"),
+    ("trust-benefits", TrustBenefit, "admin/manage/trust-benefits/"),
     ("promo-banners", PromoBanner, "admin/manage/promo-banners/"),
     ("hero-side-banners", HeroSideBanner, "admin/manage/hero-side-banners/"),
     ("coupons", Coupon, "admin/manage/coupons/"),
