@@ -20,6 +20,7 @@ from PIL import Image, UnidentifiedImageError
 from .models import (
     Address,
     AdminAuditLog,
+    Brand,
     Cart,
     Category,
     Coupon,
@@ -117,6 +118,7 @@ class AdminProductSerializer(serializers.ModelSerializer):
             "id",
             "category",
             "subcategory",
+            "brand",
             "offer",
             "name",
             "description",
@@ -343,6 +345,20 @@ class AdminUserViewSet(AdminModelViewSet):
     search_fields = ("email", "first_name", "last_name", "role")
 
 
+class AdminBrandViewSet(AdminModelViewSet):
+    queryset = Brand.objects.all().order_by("name")
+    search_fields = ("name", "slug")
+
+    def get_serializer_class(self):
+        class BrandAdminSerializer(serializers.ModelSerializer):
+            class Meta:
+                model = Brand
+                fields = "__all__"
+                read_only_fields = ("id", "created_at")
+
+        return BrandAdminSerializer
+
+
 class AdminCategoryViewSet(AdminModelViewSet):
     queryset = Category.objects.all().order_by("name")
     serializer_class = serializers.ModelSerializer
@@ -455,7 +471,7 @@ class AdminRegionViewSet(AdminModelViewSet):
 
 
 class AdminProductViewSet(AdminModelViewSet):
-    queryset = Product.objects.select_related("category", "subcategory", "offer").all()
+    queryset = Product.objects.select_related("category", "subcategory", "brand", "offer").all()
     serializer_class = AdminProductSerializer
     # Product identifiers live on the product's variants in the current
     # schema: variant SKUs are also the catalog/product codes, while
@@ -689,6 +705,7 @@ class AdminCouponUsageViewSet(AdminModelViewSet):
 
 ADMIN_RESOURCES = (
     ("users", User, "admin/manage/users/"),
+    ("brands", Brand, "admin/manage/brands/"),
     ("categories", Category, "admin/manage/categories/"),
     ("subcategories", SubCategory, "admin/manage/subcategories/"),
     ("offers", Offer, "admin/manage/offers/"),

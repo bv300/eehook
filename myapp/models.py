@@ -1,6 +1,7 @@
 from django.db import models, transaction
 from django.contrib.auth.models import ( AbstractUser, BaseUserManager)
 from django.core.exceptions import ValidationError
+from django.utils.text import slugify
 
 
 class UserManager(BaseUserManager):
@@ -75,6 +76,33 @@ class SubCategory(models.Model):
     def __str__(self):
         return self.name
 
+
+class Brand(models.Model):
+    """A catalog brand that can be assigned to one or more products."""
+
+    name = models.CharField(max_length=120, unique=True)
+    slug = models.SlugField(max_length=140, unique=True, blank=True)
+    logo = models.ImageField(upload_to="brands/", blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("name",)
+
+    def save(self, *args, **kwargs):
+        if not self.slug:
+            base_slug = slugify(self.name) or "brand"
+            candidate = base_slug
+            suffix = 2
+            while Brand.objects.filter(slug=candidate).exclude(pk=self.pk).exists():
+                candidate = f"{base_slug}-{suffix}"
+                suffix += 1
+            self.slug = candidate
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.name
+
 class Offer(models.Model):
 
     title = models.CharField(max_length=200 )
@@ -140,6 +168,13 @@ class Product(models.Model):
 
     category = models.ForeignKey(Category,on_delete=models.CASCADE)
     subcategory = models.ForeignKey( SubCategory,on_delete=models.CASCADE)
+    brand = models.ForeignKey(
+        Brand,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="products",
+    )
     offer = models.ForeignKey( Offer, on_delete=models.SET_NULL, null=True, blank=True)
     name = models.CharField( max_length=200 )
     description = models.TextField()

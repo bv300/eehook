@@ -148,6 +148,20 @@ class SubCategorySerializer(serializers.ModelSerializer):
             "is_active"
         ]
 
+
+class BrandSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = Brand
+        fields = [
+            "id",
+            "name",
+            "slug",
+            "logo",
+            "is_active",
+        ]
+        read_only_fields = ["id", "slug"]
+
 class ProductImageSerializer(serializers.ModelSerializer):
 
     class Meta:
@@ -970,6 +984,10 @@ class ProductSerializer(serializers.ModelSerializer):
         read_only=True
     )
 
+    brand = BrandSerializer(
+        read_only=True
+    )
+
     offer = OfferSerializer(
         read_only=True
     )
@@ -1001,6 +1019,7 @@ class ProductSerializer(serializers.ModelSerializer):
             "description",
             "category",
             "subcategory",
+            "brand",
             "offer",
             "variants",
             "starting_price",
@@ -1079,6 +1098,124 @@ class ProductSerializer(serializers.ModelSerializer):
                     pass
                 return [feature.strip() for feature in obj.key_features.split('\n') if feature.strip()]
         return []
+
+
+class HomepageProductSerializer(serializers.ModelSerializer):
+    """Small product-card payload used by capped homepage discovery sections."""
+
+    category = CategorySerializer(read_only=True)
+    subcategory = SubCategorySerializer(read_only=True)
+    brand = BrandSerializer(read_only=True)
+    product_image = serializers.SerializerMethodField()
+    starting_price = serializers.SerializerMethodField()
+    discounted_price = serializers.SerializerMethodField()
+    original_price = serializers.SerializerMethodField()
+    current_price = serializers.SerializerMethodField()
+    discount_amount = serializers.SerializerMethodField()
+    has_offer = serializers.SerializerMethodField()
+    discount_percentage = serializers.SerializerMethodField()
+    in_stock = serializers.SerializerMethodField()
+    default_variant_id = serializers.SerializerMethodField()
+    default_variant_unit_id = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Product
+        fields = [
+            "id",
+            "name",
+            "category",
+            "subcategory",
+            "brand",
+            "product_image",
+            "starting_price",
+            "original_price",
+            "discounted_price",
+            "current_price",
+            "discount_amount",
+            "has_offer",
+            "discount_percentage",
+            "in_stock",
+            "default_variant_id",
+            "default_variant_unit_id",
+            "shipping_fee",
+            "estimated_delivery_time",
+            "warranty_info",
+        ]
+
+    def _price_values(self, obj):
+        return get_product_prices(obj)
+
+    def _variant_choices(self, obj):
+        choices = []
+        for variant in obj.variants.all():
+            if variant.price_type == "single":
+                if variant.price is not None:
+                    choices.append((variant.price, variant.id, None, variant.stock > 0))
+                continue
+            for unit in variant.sizes.all():
+                if unit.price is not None:
+                    choices.append((unit.price, variant.id, unit.id, unit.stock > 0))
+        return sorted(
+            choices,
+            key=lambda choice: (not choice[3], choice[0], choice[1], choice[2] or 0),
+        )
+
+    def _default_choice(self, obj):
+        choices = self._variant_choices(obj)
+        return choices[0] if choices else (None, None, None, False)
+
+    def get_product_image(self, obj):
+        variant_id = self._default_choice(obj)[1]
+        variants = sorted(
+            obj.variants.all(),
+            key=lambda variant: (variant.id != variant_id, variant.id),
+        )
+        for variant in variants:
+            images = list(variant.images.all())
+            image = next((item for item in images if item.is_primary), None)
+            image = image or (images[0] if images else None)
+            if image:
+                request = self.context.get("request")
+                return request.build_absolute_uri(image.image.url) if request else image.image.url
+        return None
+
+    def get_starting_price(self, obj):
+        return self._price_values(obj)["starting_price"]
+
+    def get_original_price(self, obj):
+        return self._price_values(obj)["starting_price"]
+
+    def get_discounted_price(self, obj):
+        return self._price_values(obj)["discounted_price"]
+
+    def get_current_price(self, obj):
+        return self._price_values(obj)["discounted_price"]
+
+    def get_discount_amount(self, obj):
+        return self._price_values(obj)["discount_amount"]
+
+    def get_has_offer(self, obj):
+        return self._price_values(obj)["has_offer"]
+
+    def get_discount_percentage(self, obj):
+        return self._price_values(obj)["discount_percentage"]
+
+    def get_in_stock(self, obj):
+        return any(choice[3] for choice in self._variant_choices(obj))
+
+    def get_default_variant_id(self, obj):
+        return self._default_choice(obj)[1]
+
+    def get_default_variant_unit_id(self, obj):
+        return self._default_choice(obj)[2]
+
+
+class HomepageBrandSerializer(serializers.ModelSerializer):
+    product_count = serializers.IntegerField(read_only=True)
+
+    class Meta:
+        model = Brand
+        fields = ["id", "name", "slug", "logo", "product_count"]
 
 
 

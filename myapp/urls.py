@@ -17,6 +17,9 @@ urlpatterns = [
     path("products/",views.get_products),
     path("related-products/<int:pk>/",views.related_products),
     path("new-arrivals/",views.new_arrivals),
+    path("homepage/", views.homepage, name="homepage"),
+    path("brands/", views.homepage_brands, name="brands"),
+    path("recently-viewed/", views.recently_viewed, name="recently-viewed"),
     
     path("subcategories/",views.get_subcategories),
     path("products/",views.get_products),
@@ -108,6 +111,7 @@ from rest_framework.routers import DefaultRouter
 from .order_admin_api import SuperAdminOrderDetailView, SuperAdminOrderListView
 from .super_admin_api import (
     AdminAddressViewSet,
+    AdminBrandViewSet,
     AdminCartViewSet,
     AdminCategoryViewSet,
     AdminColorViewSet,
@@ -136,6 +140,7 @@ from .super_admin_api import (
 router = DefaultRouter()
 router.register(r'admin-coupons', views.CouponViewSet, basename='admin-coupon')
 router.register(r'admin/manage/users', AdminUserViewSet, basename='admin-manage-user')
+router.register(r'admin/manage/brands', AdminBrandViewSet, basename='admin-manage-brand')
 router.register(r'admin/manage/categories', AdminCategoryViewSet, basename='admin-manage-category')
 router.register(r'admin/manage/subcategories', AdminSubCategoryViewSet, basename='admin-manage-subcategory')
 router.register(r'admin/manage/offers', AdminOfferViewSet, basename='admin-manage-offer')

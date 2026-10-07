@@ -1,9 +1,24 @@
+from datetime import timedelta
 from decimal import Decimal
 
 from django.core.mail import send_mail
 from django.conf import settings
 from django.db import IntegrityError
-from django.db.models import Case, DecimalField, F, Min, Value, When
+from django.db.models import (
+    Case,
+    Count,
+    DecimalField,
+    F,
+    IntegerField,
+    Min,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+    Sum,
+    Value,
+    When,
+)
 from django.db.models.functions import Coalesce
 from django.contrib.auth.tokens import default_token_generator
 from django.utils.http import (
@@ -11,6 +26,7 @@ from django.utils.http import (
     urlsafe_base64_decode
 )
 from django.utils.encoding import force_bytes
+from django.utils import timezone
 
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
@@ -391,6 +407,7 @@ def get_products(request):
 
     category = request.GET.get("category")
     subcategory = request.GET.get("subcategory")
+    brand = request.GET.get("brand") or request.GET.get("brand_id")
     sort = request.GET.get("sort")
 
     # IDs are parsed as integers before they reach the ORM; ordering is a
@@ -415,6 +432,15 @@ def get_products(request):
             subcategory_id=subcategory
         )
 
+    if brand:
+        brand = str(brand).strip()
+        if brand.isdigit():
+            if int(brand) < 1:
+                return Response({"error": "Invalid brand"}, status=400)
+            products = products.filter(brand_id=int(brand), brand__is_active=True)
+        else:
+            products = products.filter(brand__slug=brand.lower(), brand__is_active=True)
+
     products = _order_public_products(products, sort).distinct()
     return _paginate_public_products(request, products)
     
@@ -424,9 +450,20 @@ def product_details( request,pk): #PRODUCT DETAIL PAGE IL SIZE UM COLOR SELET CH
 
     try:
 
-        product = Product.objects.get(
-            id=pk,
-            is_active=True
+        product = (
+            Product.objects
+            .select_related("category", "subcategory", "brand", "offer")
+            .prefetch_related(
+                Prefetch(
+                    "variants",
+                    queryset=(
+                        ProductVariant.objects
+                        .select_related("color")
+                        .prefetch_related("images", "sizes__unit__unit_type")
+                    ),
+                )
+            )
+            .get(id=pk, is_active=True)
         )
         
         # Track unique view only if not a bot
@@ -478,9 +515,7 @@ def product_details( request,pk): #PRODUCT DETAIL PAGE IL SIZE UM COLOR SELET CH
             status=404
         )
 
-    serializer = ProductSerializer(
-        product
-    )
+    serializer = ProductSerializer(product, context={"request": request})
 
     return Response(
         serializer.data
@@ -536,6 +571,382 @@ def new_arrivals(request):
 
     return Response(
         serializer.data
+    )
+
+
+HOMEPAGE_PRODUCT_LIMIT = 16
+TRENDING_LOOKBACK_DAYS = 30
+
+
+def _homepage_product_queryset(products=None):
+    """Return the small, eager-loaded catalog queryset used by home cards."""
+    if products is None:
+        products = Product.objects.filter(is_active=True)
+
+    variant_queryset = (
+        ProductVariant.objects
+        .select_related("color")
+        .prefetch_related("images", "sizes__unit__unit_type")
+        .order_by("id")
+    )
+    return (
+        products
+        .filter(is_active=True)
+        .filter(
+            Q(variants__price_type="single", variants__price__isnull=False)
+            | Q(variants__price_type="multiple", variants__sizes__price__isnull=False)
+        )
+        .select_related("category", "subcategory", "brand", "offer")
+        .prefetch_related(Prefetch("variants", queryset=variant_queryset))
+        .distinct()
+    )
+
+
+def _successful_sales_subquery():
+    """Quantity sold from paid orders, excluding cancelled orders."""
+    return (
+        OrderItem.objects
+        .filter(
+            product=OuterRef("pk"),
+            order__payment_status="Paid",
+            order__status__in=("Pending", "Processing", "Shipped", "Delivered"),
+        )
+        .values("product")
+        .annotate(total=Sum("quantity"))
+        .values("total")
+    )
+
+
+def _activity_count_subquery(model, filters, group_field):
+    return (
+        model.objects
+        .filter(**filters)
+        .values(group_field)
+        .annotate(total=Count("id"))
+        .values("total")
+    )
+
+
+def _trending_products():
+    since = timezone.now() - timedelta(days=TRENDING_LOOKBACK_DAYS)
+    recent_views = _activity_count_subquery(
+        ProductView,
+        {"product": OuterRef("pk"), "created_at__gte": since},
+        "product",
+    )
+    wishlist_activity = _activity_count_subquery(
+        Wishlist,
+        {"variant__product": OuterRef("pk")},
+        "variant__product",
+    )
+    cart_activity = _activity_count_subquery(
+        Cart,
+        {"variant__product": OuterRef("pk")},
+        "variant__product",
+    )
+    sales = _successful_sales_subquery()
+
+    return (
+        _homepage_product_queryset()
+        .annotate(
+            _recent_views=Coalesce(
+                Subquery(recent_views, output_field=IntegerField()),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            _wishlist_activity=Coalesce(
+                Subquery(wishlist_activity, output_field=IntegerField()),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            _cart_activity=Coalesce(
+                Subquery(cart_activity, output_field=IntegerField()),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            _sales_quantity=Coalesce(
+                Subquery(sales, output_field=IntegerField()),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+        )
+        .annotate(
+            _trending_score=(
+                F("_recent_views")
+                + F("_wishlist_activity") * Value(3)
+                + F("_cart_activity") * Value(4)
+                + F("_sales_quantity") * Value(6)
+            )
+        )
+        .order_by("-_trending_score", "-updated_at", "-id")[:HOMEPAGE_PRODUCT_LIMIT]
+    )
+
+
+def _top_deal_products():
+    today = timezone.localdate()
+    return (
+        _homepage_product_queryset()
+        .filter(
+            offer__is_active=True,
+            offer__start_date__lte=today,
+            offer__end_date__gte=today,
+        )
+        .annotate(_catalog_price=_catalog_price_expression())
+        .order_by("-offer__discount_percentage", "_catalog_price", "-updated_at", "-id")[
+            :HOMEPAGE_PRODUCT_LIMIT
+        ]
+    )
+
+
+def _best_seller_products():
+    return (
+        _homepage_product_queryset()
+        .annotate(
+            _sales_quantity=Coalesce(
+                Subquery(_successful_sales_subquery(), output_field=IntegerField()),
+                Value(0),
+                output_field=IntegerField(),
+            )
+        )
+        .filter(_sales_quantity__gt=0)
+        .order_by("-_sales_quantity", "-updated_at", "-id")[:HOMEPAGE_PRODUCT_LIMIT]
+    )
+
+
+def _new_homepage_products():
+    return _homepage_product_queryset().order_by("-created_at", "-id")[:HOMEPAGE_PRODUCT_LIMIT]
+
+
+def _request_ip(request):
+    forwarded = request.META.get("HTTP_X_FORWARDED_FOR")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.META.get("REMOTE_ADDR")
+
+
+def _recently_viewed_products(request):
+    if request.user and request.user.is_authenticated:
+        views = ProductView.objects.filter(user=request.user)
+    else:
+        ip_address = _request_ip(request)
+        if not ip_address:
+            return Product.objects.none()
+        views = ProductView.objects.filter(user__isnull=True, ip_address=ip_address)
+
+    # ProductView is intentionally not unique in the database because the same
+    # product can be viewed by an authenticated user and an IP. Deduplicate in
+    # the small recent-ID list before querying the product catalog.
+    product_ids = []
+    for product_id in views.order_by("-created_at", "-id").values_list("product_id", flat=True)[:64]:
+        if product_id not in product_ids:
+            product_ids.append(product_id)
+        if len(product_ids) == HOMEPAGE_PRODUCT_LIMIT:
+            break
+
+    if not product_ids:
+        return Product.objects.none()
+
+    preserved_order = Case(
+        *[When(pk=product_id, then=position) for position, product_id in enumerate(product_ids)],
+        output_field=IntegerField(),
+    )
+    return _homepage_product_queryset(
+        Product.objects.filter(pk__in=product_ids)
+    ).annotate(_recent_order=preserved_order).order_by("_recent_order")
+
+
+def _user_signal_product_ids(user):
+    ids = []
+    sources = (
+        ProductView.objects.filter(user=user).order_by("-created_at").values_list("product_id", flat=True)[:32],
+        Wishlist.objects.filter(user=user).values_list("variant__product_id", flat=True)[:32],
+        Cart.objects.filter(user=user).values_list("variant__product_id", flat=True)[:32],
+        OrderItem.objects.filter(
+            order__user=user,
+            order__payment_status="Paid",
+            order__status__in=("Pending", "Processing", "Shipped", "Delivered"),
+        ).values_list("product_id", flat=True)[:32],
+    )
+    for source in sources:
+        for product_id in source:
+            if product_id and product_id not in ids:
+                ids.append(product_id)
+            if len(ids) >= 64:
+                return ids
+    return ids
+
+
+def _just_for_you_products(request):
+    selected = []
+    selected_ids = set()
+    signal_ids = []
+    if request.user and request.user.is_authenticated:
+        signal_ids = _user_signal_product_ids(request.user)
+
+    if signal_ids:
+        signal_products = Product.objects.filter(pk__in=signal_ids).values(
+            "category_id", "subcategory_id", "brand_id"
+        )
+        category_ids = set()
+        subcategory_ids = set()
+        brand_ids = set()
+        for signal in signal_products:
+            if signal["category_id"]:
+                category_ids.add(signal["category_id"])
+            if signal["subcategory_id"]:
+                subcategory_ids.add(signal["subcategory_id"])
+            if signal["brand_id"]:
+                brand_ids.add(signal["brand_id"])
+
+        related_filter = Q(pk__in=[])
+        score_parts = []
+        if category_ids:
+            related_filter |= Q(category_id__in=category_ids)
+            score_parts.append(("_category_match", category_ids, 2))
+        if subcategory_ids:
+            related_filter |= Q(subcategory_id__in=subcategory_ids)
+            score_parts.append(("_subcategory_match", subcategory_ids, 3))
+        if brand_ids:
+            related_filter |= Q(brand_id__in=brand_ids)
+            score_parts.append(("_brand_match", brand_ids, 3))
+
+        if score_parts:
+            related = _homepage_product_queryset().filter(related_filter).exclude(pk__in=signal_ids)
+            score_annotations = {}
+            score_expression = Value(0)
+            for name, ids, weight in score_parts:
+                score_annotations[name] = Case(
+                    When(**{name.removeprefix("_").replace("_match", "_id") + "__in": ids}, then=Value(1)),
+                    default=Value(0),
+                    output_field=IntegerField(),
+                )
+                score_expression += F(name) * Value(weight)
+            related = related.annotate(**score_annotations).annotate(
+                _recommendation_score=score_expression
+            ).order_by("-_recommendation_score", "-updated_at", "-id")[:HOMEPAGE_PRODUCT_LIMIT]
+            for product in related:
+                selected.append(product)
+                selected_ids.add(product.id)
+
+    # Guests and users without enough useful signals get real catalog
+    # fallbacks. The same product is never repeated inside this section.
+    for queryset in (_trending_products(), _best_seller_products(), _new_homepage_products()):
+        if len(selected) >= HOMEPAGE_PRODUCT_LIMIT:
+            break
+        for product in queryset:
+            if product.id not in selected_ids:
+                selected.append(product)
+                selected_ids.add(product.id)
+            if len(selected) >= HOMEPAGE_PRODUCT_LIMIT:
+                break
+    return selected[:HOMEPAGE_PRODUCT_LIMIT]
+
+
+def _homepage_brands():
+    product_filter = Q(products__is_active=True)
+    return (
+        Brand.objects
+        .filter(is_active=True)
+        .annotate(product_count=Count("products", filter=product_filter, distinct=True))
+        .filter(product_count__gt=0)
+        .order_by("-product_count", "name")[:HOMEPAGE_PRODUCT_LIMIT]
+    )
+
+
+def _homepage_trust_benefits():
+    benefits = [
+        {
+            "key": "delivery-information",
+            "title": "Clear delivery information",
+            "description": "Shipping charges and estimated delivery timing are shown before checkout.",
+        }
+    ]
+    if settings.STRIPE_PUBLISHABLE_KEY or settings.STRIPE_SECRET_KEY:
+        benefits.insert(
+            0,
+            {
+                "key": "secure-payment",
+                "title": "Secure payment",
+                "description": "Payments are processed through Stripe checkout.",
+            },
+        )
+    if settings.WHATSAPP_ACCESS_TOKEN and settings.WHATSAPP_PHONE_NUMBER_ID:
+        benefits.append(
+            {
+                "key": "customer-support",
+                "title": "Customer support",
+                "description": "Order support is available through the configured support channel.",
+            }
+        )
+    return benefits
+
+
+def _homepage_product_data(products, request):
+    return HomepageProductSerializer(
+        products,
+        many=True,
+        context={"request": request},
+    ).data
+
+
+@api_view(["GET"])
+def homepage(request):
+    categories = (
+        Category.objects
+        .filter(is_active=True)
+        .prefetch_related(
+            Prefetch(
+                "subcategories",
+                queryset=SubCategory.objects.filter(is_active=True).order_by("name"),
+            )
+        )
+    )
+    recently_viewed = _recently_viewed_products(request)
+
+    return Response(
+        {
+            "limits": {"products_per_section": HOMEPAGE_PRODUCT_LIMIT},
+            "hero_banners": HeroBannerSerializer(
+                HeroBanner.objects.filter(is_active=True).order_by("display_order"),
+                many=True,
+                context={"request": request},
+            ).data,
+            "categories": HomeCategorySerializer(
+                categories,
+                many=True,
+                context={"request": request},
+            ).data,
+            "new_arrivals": _homepage_product_data(_new_homepage_products(), request),
+            "trending_now": _homepage_product_data(_trending_products(), request),
+            "top_deals": _homepage_product_data(_top_deal_products(), request),
+            "best_sellers": _homepage_product_data(_best_seller_products(), request),
+            "just_for_you": _homepage_product_data(_just_for_you_products(request), request),
+            "shop_by_brand": HomepageBrandSerializer(
+                _homepage_brands(),
+                many=True,
+                context={"request": request},
+            ).data,
+            "recently_viewed": _homepage_product_data(recently_viewed, request),
+            "trust_benefits": _homepage_trust_benefits(),
+        }
+    )
+
+
+@api_view(["GET"])
+def homepage_brands(request):
+    return Response(
+        HomepageBrandSerializer(
+            _homepage_brands(),
+            many=True,
+            context={"request": request},
+        ).data
+    )
+
+
+@api_view(["GET"])
+def recently_viewed(request):
+    return Response(
+        _homepage_product_data(_recently_viewed_products(request), request)
     )
     
 @api_view(["GET"])
