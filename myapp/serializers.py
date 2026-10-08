@@ -1909,6 +1909,7 @@ class WelcomeBonusNotificationSerializer(serializers.ModelSerializer):
     title = serializers.SerializerMethodField()
     message = serializers.SerializerMethodField()
     discount_text = serializers.SerializerMethodField()
+    eligible_target = serializers.SerializerMethodField()
     masked_code = serializers.SerializerMethodField()
     assignment_status = serializers.SerializerMethodField()
     can_claim = serializers.SerializerMethodField()
@@ -1923,6 +1924,7 @@ class WelcomeBonusNotificationSerializer(serializers.ModelSerializer):
             "title",
             "message",
             "discount_text",
+            "eligible_target",
             "masked_code",
             "assignment_status",
             "can_claim",
@@ -1943,6 +1945,20 @@ class WelcomeBonusNotificationSerializer(serializers.ModelSerializer):
         if welcome_bonus.discount_type == WelcomeBonus.DISCOUNT_FIXED:
             return f"Get {welcome_bonus.fixed_amount} OFF on eligible products."
         return f"Get {welcome_bonus.discount_percentage}% OFF on eligible products."
+
+    def get_eligible_target(self, obj):
+        """A display-safe product/category target for the notification UI."""
+        welcome_bonus = obj.assignment.welcome_bonus
+        if welcome_bonus.applicability_type == WelcomeBonus.APPLICABILITY_CATEGORY:
+            category_name = welcome_bonus.category.name if welcome_bonus.category else "selected category"
+            return f"Valid for category: {category_name}"
+
+        product_names = list(welcome_bonus.products.values_list("name", flat=True))
+        if len(product_names) == 1:
+            return f"Valid for: {product_names[0]}"
+        if product_names:
+            return f"Valid for: {', '.join(product_names)}"
+        return "Valid for selected products."
 
     def get_masked_code(self, obj):
         return "••••••••••••••••"

@@ -1740,6 +1740,7 @@ class WelcomeBonusFlowTests(TestCase):
         self.assertEqual(response.data["unread_count"], 1)
         payload = response.data["notifications"][0]
         self.assertEqual(payload["masked_code"], "••••••••••••••••")
+        self.assertEqual(payload["eligible_target"], "Valid for: Welcome shoe")
         self.assertNotIn("code", payload)
         self.assertNotIn(self.assignment.code, str(payload))
 
