@@ -36,6 +36,7 @@ from .models import (
     OrderItem,
     Product,
     ProductImage,
+    ProductRelatedProduct,
     ProductVariant,
     ProductVariantUnit,
     ProductView,
@@ -1426,3 +1427,225 @@ class HomepageDiscoveryTests(TestCase):
         recent_response = self.client.get("/recently-viewed/")
         self.assertEqual(recent_response.status_code, 200)
         self.assertEqual([item["id"] for item in recent_response.data], [product.id])
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class RelatedProductsTests(TestCase):
+    """Contract tests for the product-detail, admin, and existing cart APIs."""
+
+    def setUp(self):
+        self.client = APIClient()
+        self.customer = User.objects.create_user(
+            email="related-customer@example.invalid",
+            password="CustomerPass123!",
+            role="Customer",
+        )
+        self.admin = User.objects.create_superuser(
+            email="related-admin@example.invalid",
+            password="AdminPass123!",
+        )
+        self.category = Category.objects.create(name="Related electronics", image="category.jpg")
+        self.other_category = Category.objects.create(name="Related home", image="home.jpg")
+        self.subcategory = SubCategory.objects.create(
+            category=self.category, name="Related mobiles"
+        )
+        self.other_subcategory = SubCategory.objects.create(
+            category=self.category, name="Related accessories"
+        )
+        self.home_subcategory = SubCategory.objects.create(
+            category=self.other_category, name="Related appliances"
+        )
+        self.main, self.main_variant = self.make_product("Related phone")
+        self.charger, self.charger_variant = self.make_product("Related charger")
+        self.case, self.case_variant = self.make_product(
+            "Related case", variants=2
+        )
+        self.out_of_stock, self.out_of_stock_variant = self.make_product(
+            "Related unavailable", stock=0
+        )
+        self.unrelated, self.unrelated_variant = self.make_product(
+            "Related refrigerator",
+            category=self.other_category,
+            subcategory=self.home_subcategory,
+        )
+        self.client.force_authenticate(user=self.customer)
+
+    def make_product(self, name, *, category=None, subcategory=None, stock=5, variants=1):
+        product = Product.objects.create(
+            category=category or self.category,
+            subcategory=subcategory or self.subcategory,
+            name=name,
+            description=f"{name} description",
+        )
+        first_variant = None
+        for index in range(variants):
+            color = Color.objects.create(
+                name=f"{name} color {index}", code=f"#{index + 11:06d}"
+            ) if variants > 1 else None
+            variant = ProductVariant.objects.create(
+                product=product,
+                color=color,
+                price_type="single",
+                price=Decimal("100.00") + index,
+                stock=stock,
+            )
+            first_variant = first_variant or variant
+        return product, first_variant
+
+    def configure_manual(self, *products):
+        self.main.related_product_mode = Product.RELATED_PRODUCT_MODE_MANUAL
+        self.main.save(update_fields=("related_product_mode",))
+        ProductRelatedProduct.objects.bulk_create(
+            [
+                ProductRelatedProduct(
+                    product=self.main, related_product=product, position=position
+                )
+                for position, product in enumerate(products)
+            ]
+        )
+
+    def add_main(self):
+        return self.client.post(
+            "/cart/add/", {"variant": self.main_variant.id, "quantity": 1}, format="json"
+        )
+
+    def test_none_mode_has_no_prompt_or_detail_recommendations(self):
+        response = self.add_main()
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["related_products"], [])
+        detail = self.client.get(f"/product/{self.main.id}/")
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertEqual(detail.data["related_products"], [])
+
+    def test_manual_mode_detail_preserves_order_and_filters_unavailable_targets(self):
+        self.configure_manual(self.charger, self.out_of_stock, self.case)
+        detail = self.client.get(f"/product/{self.main.id}/")
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertEqual(
+            [item["id"] for item in detail.data["related_products"]],
+            [self.charger.id, self.case.id],
+        )
+        self.assertLessEqual(len(detail.data["related_products"]), 4)
+        self.assertNotIn(self.main.id, [item["id"] for item in detail.data["related_products"]])
+
+    def test_automatic_mode_prefers_same_subcategory_and_never_returns_broad_unrelated_items(self):
+        self.main.related_product_mode = Product.RELATED_PRODUCT_MODE_AUTOMATIC
+        self.main.save(update_fields=("related_product_mode",))
+        response = self.add_main()
+        self.assertEqual(response.status_code, 200, response.data)
+        ids = [item["id"] for item in response.data["related_products"]]
+        self.assertIn(self.charger.id, ids)
+        self.assertNotIn(self.main.id, ids)
+        self.assertNotIn(self.unrelated.id, ids)
+        self.assertLessEqual(len(ids), 4)
+
+    def test_related_cart_confirmation_adds_only_selected_authorized_products(self):
+        self.configure_manual(self.charger, self.case)
+        first = self.add_main()
+        self.assertEqual(first.status_code, 200, first.data)
+        selected = self.client.post(
+            "/cart/add/",
+            {
+                "source_product": self.main.id,
+                "related_products": [{"product": self.charger.id}],
+            },
+            format="json",
+        )
+        self.assertEqual(selected.status_code, 200, selected.data)
+        self.assertEqual(selected.data["related_products_added"], [self.charger.id])
+        self.assertEqual(
+            set(Cart.objects.filter(user=self.customer).values_list("variant__product_id", flat=True)),
+            {self.main.id, self.charger.id},
+        )
+
+    def test_cart_rejects_injected_unrelated_product(self):
+        self.configure_manual(self.charger)
+        self.assertEqual(self.add_main().status_code, 200)
+        response = self.client.post(
+            "/cart/add/",
+            {
+                "source_product": self.main.id,
+                "related_products": [{"product": self.unrelated.id, "variant": self.unrelated_variant.id}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(response.data["error_code"], "RELATED_PRODUCT_NOT_ALLOWED")
+        self.assertFalse(Cart.objects.filter(user=self.customer, variant=self.unrelated_variant).exists())
+
+    def test_related_product_requires_explicit_choice_for_multiple_variants(self):
+        self.configure_manual(self.case)
+        self.assertEqual(self.add_main().status_code, 200)
+        missing_variant = self.client.post(
+            "/cart/add/",
+            {"source_product": self.main.id, "related_products": [{"product": self.case.id}]},
+            format="json",
+        )
+        self.assertEqual(missing_variant.status_code, 400, missing_variant.data)
+        self.assertEqual(missing_variant.data["error_code"], "RELATED_VARIANT_REQUIRED")
+        selected = self.client.post(
+            "/cart/add/",
+            {
+                "source_product": self.main.id,
+                "related_products": [{"product": self.case.id, "variant": self.case_variant.id}],
+            },
+            format="json",
+        )
+        self.assertEqual(selected.status_code, 200, selected.data)
+        self.assertTrue(Cart.objects.filter(user=self.customer, variant=self.case_variant).exists())
+
+    def test_selected_product_that_sells_out_is_skipped_without_blocking_the_main_item(self):
+        self.configure_manual(self.charger)
+        first = self.add_main()
+        self.assertEqual(first.status_code, 200, first.data)
+        self.charger_variant.stock = 0
+        self.charger_variant.save(update_fields=("stock",))
+        selected = self.client.post(
+            "/cart/add/",
+            {"source_product": self.main.id, "related_products": [{"product": self.charger.id}]},
+            format="json",
+        )
+        self.assertEqual(selected.status_code, 200, selected.data)
+        self.assertIn("no longer available", selected.data["message"])
+        self.assertTrue(Cart.objects.filter(user=self.customer, variant=self.main_variant).exists())
+        self.assertFalse(Cart.objects.filter(user=self.customer, variant=self.charger_variant).exists())
+
+    def test_admin_api_enforces_manual_limit_self_reference_and_mode_switches(self):
+        self.client.force_authenticate(user=self.admin)
+        too_many = self.client.patch(
+            f"/admin/manage/products/{self.main.id}/",
+            {
+                "related_product_mode": "manual",
+                "related_product_ids": [
+                    self.charger.id,
+                    self.case.id,
+                    self.out_of_stock.id,
+                    self.unrelated.id,
+                    self.main.id,
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(too_many.status_code, 400, too_many.data)
+        self.assertIn("related_product_ids", too_many.data)
+
+        updated = self.client.patch(
+            f"/admin/manage/products/{self.main.id}/",
+            {
+                "related_product_mode": "manual",
+                "related_product_ids": [self.case.id, self.charger.id],
+            },
+            format="json",
+        )
+        self.assertEqual(updated.status_code, 200, updated.data)
+        self.assertEqual(
+            [item["id"] for item in updated.data["manual_related_products"]],
+            [self.case.id, self.charger.id],
+        )
+        disabled = self.client.patch(
+            f"/admin/manage/products/{self.main.id}/",
+            {"related_product_mode": "none"},
+            format="json",
+        )
+        self.assertEqual(disabled.status_code, 200, disabled.data)
+        self.assertFalse(ProductRelatedProduct.objects.filter(product=self.main).exists())

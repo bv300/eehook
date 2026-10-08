@@ -1,6 +1,7 @@
 from django.db import models, transaction
 from django.contrib.auth.models import ( AbstractUser, BaseUserManager)
 from django.core.exceptions import ValidationError
+from django.core.validators import MaxValueValidator, MinValueValidator
 from django.utils.text import slugify
 
 
@@ -166,6 +167,15 @@ class Region(models.Model):
 
 class Product(models.Model):
 
+    RELATED_PRODUCT_MODE_NONE = "none"
+    RELATED_PRODUCT_MODE_MANUAL = "manual"
+    RELATED_PRODUCT_MODE_AUTOMATIC = "automatic"
+    RELATED_PRODUCT_MODE_CHOICES = (
+        (RELATED_PRODUCT_MODE_NONE, "None"),
+        (RELATED_PRODUCT_MODE_MANUAL, "Manual"),
+        (RELATED_PRODUCT_MODE_AUTOMATIC, "Automatic"),
+    )
+
     category = models.ForeignKey(Category,on_delete=models.CASCADE)
     subcategory = models.ForeignKey( SubCategory,on_delete=models.CASCADE)
     brand = models.ForeignKey(
@@ -193,6 +203,21 @@ class Product(models.Model):
     current_viewers_count = models.PositiveIntegerField(default=0)
     promotional_banner_image = models.ImageField(upload_to="promotional_banners/", blank=True, null=True)
     promotional_banner_link = models.URLField(max_length=500, blank=True, null=True)
+    related_product_mode = models.CharField(
+        max_length=12,
+        choices=RELATED_PRODUCT_MODE_CHOICES,
+        default=RELATED_PRODUCT_MODE_NONE,
+        help_text="Choose whether related products are hidden, curated manually, or selected automatically.",
+    )
+    # The explicit through model keeps the merchant's manual ordering and
+    # makes the maximum of four a database-backed invariant.
+    related_products = models.ManyToManyField(
+        "self",
+        through="ProductRelatedProduct",
+        symmetrical=False,
+        related_name="related_to_products",
+        blank=True,
+    )
 
     def __str__(self):
         return self.name
@@ -211,6 +236,57 @@ class Product(models.Model):
         # product can accidentally re-enable it.
         self.emi_available = False
         self.emi_starting_price = None
+
+
+class ProductRelatedProduct(models.Model):
+    """An ordered, directed related-product choice made by a merchant."""
+
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name="related_product_links",
+    )
+    related_product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name="related_from_links",
+    )
+    position = models.PositiveSmallIntegerField(
+        validators=(MinValueValidator(0), MaxValueValidator(3)),
+        help_text="Display order, from 0 to 3.",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("position", "id")
+        constraints = (
+            models.UniqueConstraint(
+                fields=("product", "related_product"),
+                name="myapp_related_product_unique_target",
+            ),
+            models.UniqueConstraint(
+                fields=("product", "position"),
+                name="myapp_related_product_unique_position",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(position__gte=0, position__lte=3),
+                name="myapp_related_product_position_range",
+            ),
+            models.CheckConstraint(
+                condition=~models.Q(product=models.F("related_product")),
+                name="myapp_related_product_not_self",
+            ),
+        )
+
+    def clean(self):
+        super().clean()
+        if self.product_id and self.related_product_id == self.product_id:
+            raise ValidationError(
+                {"related_product": "A product cannot be related to itself."}
+            )
+
+    def __str__(self):
+        return f"{self.product} -> {self.related_product} ({self.position + 1})"
 
 class ProductView(models.Model):
     product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name="unique_views")

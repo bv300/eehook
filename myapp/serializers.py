@@ -344,6 +344,80 @@ class ProductVariantSerializer(serializers.ModelSerializer):
         return 0
 
 
+class RelatedProductSerializer(serializers.ModelSerializer):
+    """The compact, purchasable payload used by the add-to-cart chooser."""
+
+    variants = ProductVariantSerializer(many=True, read_only=True)
+    image = serializers.SerializerMethodField()
+    starting_price = serializers.SerializerMethodField()
+    discounted_price = serializers.SerializerMethodField()
+    discount_amount = serializers.SerializerMethodField()
+    has_offer = serializers.SerializerMethodField()
+    discount_percentage = serializers.SerializerMethodField()
+    requires_variant_selection = serializers.SerializerMethodField()
+    default_variant_id = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Product
+        fields = (
+            "id",
+            "name",
+            "description",
+            "image",
+            "variants",
+            "starting_price",
+            "discounted_price",
+            "discount_amount",
+            "has_offer",
+            "discount_percentage",
+            "requires_variant_selection",
+            "default_variant_id",
+        )
+
+    def _variants(self, obj):
+        # The related-product service prefetches only purchasable variants.
+        # Keeping this conversion in one place also avoids accidental query
+        # repetition while serializing image and variant-choice fields.
+        return list(obj.variants.all())
+
+    def get_image(self, obj):
+        for variant in self._variants(obj):
+            images = list(variant.images.all())
+            primary = next((image for image in images if image.is_primary), None)
+            image = primary or (images[0] if images else None)
+            if image:
+                return image.image.url
+        return None
+
+    def _prices(self, obj):
+        return get_product_prices(obj)
+
+    def get_starting_price(self, obj):
+        return self._prices(obj)["starting_price"]
+
+    def get_discounted_price(self, obj):
+        return self._prices(obj)["discounted_price"]
+
+    def get_discount_amount(self, obj):
+        return self._prices(obj)["discount_amount"]
+
+    def get_has_offer(self, obj):
+        return self._prices(obj)["has_offer"]
+
+    def get_discount_percentage(self, obj):
+        return self._prices(obj)["discount_percentage"]
+
+    def get_requires_variant_selection(self, obj):
+        variants = self._variants(obj)
+        return len(variants) != 1 or variants[0].price_type == "multiple"
+
+    def get_default_variant_id(self, obj):
+        variants = self._variants(obj)
+        if len(variants) == 1 and variants[0].price_type == "single":
+            return variants[0].id
+        return None
+
+
 class CartSerializer(serializers.ModelSerializer):
 
     product = serializers.IntegerField(
@@ -1041,6 +1115,8 @@ class ProductSerializer(serializers.ModelSerializer):
 
     key_features = serializers.SerializerMethodField()
 
+    related_products = serializers.SerializerMethodField()
+
     class Meta:
 
         model = Product
@@ -1069,6 +1145,7 @@ class ProductSerializer(serializers.ModelSerializer):
             "current_viewers_count",
             "promotional_banner_image",
             "promotional_banner_link",
+            "related_products",
         ]
 
     def get_starting_price(
@@ -1130,6 +1207,21 @@ class ProductSerializer(serializers.ModelSerializer):
                     pass
                 return [feature.strip() for feature in obj.key_features.split('\n') if feature.strip()]
         return []
+
+    def get_related_products(self, obj):
+        # Kept on the existing product-detail serializer so no parallel
+        # product-detail endpoint is needed for the chooser. Catalog lists
+        # intentionally opt out, avoiding recommendation queries per card.
+        if not self.context.get("include_related_products", False):
+            return []
+        from .related_products import get_related_products
+
+        products = get_related_products(obj)
+        return RelatedProductSerializer(
+            products,
+            many=True,
+            context=self.context,
+        ).data
 
 
 class HomepageProductSerializer(serializers.ModelSerializer):

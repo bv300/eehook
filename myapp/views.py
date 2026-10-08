@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from django.core.mail import send_mail
 from django.conf import settings
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.db.models import (
     Case,
     Count,
@@ -515,7 +515,10 @@ def product_details( request,pk): #PRODUCT DETAIL PAGE IL SIZE UM COLOR SELET CH
             status=404
         )
 
-    serializer = ProductSerializer(product, context={"request": request})
+    serializer = ProductSerializer(
+        product,
+        context={"request": request, "include_related_products": True},
+    )
 
     return Response(
         serializer.data
@@ -526,34 +529,29 @@ def related_products(
     request,
     pk
 ):
+    """Compatibility route for clients that already consume this endpoint.
 
+    The existing product-detail API now embeds the same data.  This route is
+    intentionally kept, but no longer returns arbitrary category neighbours.
+    """
     try:
-
-        product = Product.objects.get(
-            id=pk
-        )
-
+        product = Product.objects.get(id=pk, is_active=True)
     except Product.DoesNotExist:
+        return Response({"message": "Product not found"}, status=404)
 
-        return Response(
-            {
-                "message":
-                "Product not found"
-            },
-            status=404
-        )
+    from .related_products import get_related_products
 
-    products = Product.objects.filter(
-
-        category=product.category,
-
-        is_active=True
-
-    ).exclude(
-        id=pk
+    products = get_related_products(product)
+    # Retain the legacy route's paginated envelope for existing consumers,
+    # while its results now follow the configured related-product rules.
+    paginator = PublicProductPagination()
+    page = paginator.paginate_queryset(products, request)
+    serializer = RelatedProductSerializer(
+        page,
+        many=True,
+        context={"request": request},
     )
-
-    return _paginate_public_products(request, products.order_by("-created_at"))
+    return paginator.get_paginated_response(serializer.data)
     
 @api_view(["GET"])
 def new_arrivals(request):
@@ -1064,157 +1062,132 @@ def _refresh_cart_coupon(cart_item):
     return None
 
 
-@api_view(["POST"])
-@permission_classes([IsAuthenticated])
-def add_to_cart(request):
+class CartAddError(Exception):
+    """A controlled validation error for the existing cart endpoint."""
 
-    print("USER =", request.user)
-    print("AUTH =", request.auth)
+    def __init__(self, message, status_code=status.HTTP_400_BAD_REQUEST, code=None):
+        self.message = message
+        self.status_code = status_code
+        self.code = code
+        super().__init__(message)
 
-    variant_id = request.data.get(
-        "variant"
-    )
 
-    variant_unit_id = request.data.get(
-        "variant_size"
-    )
-
+def _cart_quantity(value):
     try:
-
-        quantity = int(
-            request.data.get(
-                "quantity",
-                1
-            )
-        )
-
+        quantity = int(value if value is not None else 1)
     except (TypeError, ValueError):
-
-        return Response(
-            {
-                "message":
-                "Invalid quantity"
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
+        raise CartAddError("Invalid quantity")
     if quantity < 1:
+        raise CartAddError("Quantity must be greater than 0")
+    return quantity
 
-        return Response(
-            {
-                "message":
-                "Quantity must be greater than 0"
-            },
-            status=status.HTTP_400_BAD_REQUEST
-        )
 
+def _resolve_cart_variant(variant_id, variant_unit_id, quantity, *, require_variant_unit=False):
+    """Resolve one SKU with current stock and price-shape validation."""
+    if not variant_id:
+        raise CartAddError("Variant is required")
     try:
+        variant = ProductVariant.objects.select_related("product").get(id=int(variant_id))
+    except (TypeError, ValueError, ProductVariant.DoesNotExist):
+        raise CartAddError("Variant not found", status.HTTP_404_NOT_FOUND)
 
-        variant = ProductVariant.objects.select_related(
-            "product"
-        ).get(
-            id=variant_id
+    variant_unit = None
+    if variant_unit_id:
+        try:
+            variant_unit = ProductVariantUnit.objects.select_related("variant").get(
+                id=int(variant_unit_id)
+            )
+        except (TypeError, ValueError, ProductVariantUnit.DoesNotExist):
+            raise CartAddError("Variant unit not found", status.HTTP_404_NOT_FOUND)
+        if variant.price_type != "multiple":
+            raise CartAddError("A unit can only be selected for a multiple-price product")
+        if variant_unit.variant_id != variant.id:
+            raise CartAddError("Invalid unit selected")
+    elif variant.price_type == "multiple":
+        if require_variant_unit:
+            raise CartAddError(
+                "Select a variant option before adding this related product.",
+                code="RELATED_VARIANT_REQUIRED",
+            )
+        variant_unit = (
+            ProductVariantUnit.objects.select_related("variant")
+            .filter(variant=variant)
+            .first()
         )
-
-        variant_unit = None
-        if variant_unit_id:
-            variant_unit = ProductVariantUnit.objects.select_related("variant").get(id=variant_unit_id)
-            if variant.price_type != "multiple":
-                return Response(
-                    {"message": "A unit can only be selected for a multiple-price product"},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            if variant_unit.variant_id != variant.id:
-                return Response(
-                    {"message": "Invalid unit selected"},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-        elif variant.price_type == "multiple":
-            variant_unit = ProductVariantUnit.objects.select_related("variant").filter(variant=variant).first()
-
-    except ProductVariant.DoesNotExist:
-        return Response({"message": "Variant not found"}, status=status.HTTP_404_NOT_FOUND)
-    except ProductVariantUnit.DoesNotExist:
-        return Response({"message": "Variant unit not found"}, status=status.HTTP_404_NOT_FOUND)
 
     if variant.price_type == "multiple":
         if not variant_unit:
-            return Response({"message": "Out of stock"}, status=status.HTTP_400_BAD_REQUEST)
-        if variant_unit.variant != variant:
-            return Response({"message": "Invalid unit selected"}, status=status.HTTP_400_BAD_REQUEST)
+            raise CartAddError("Out of stock")
+        if variant_unit.variant_id != variant.id:
+            raise CartAddError("Invalid unit selected")
+        if variant_unit.price is None:
+            raise CartAddError("This variant is not available")
         available_stock = variant_unit.stock
     else:
+        if variant.price is None:
+            raise CartAddError("This variant is not available")
         available_stock = variant.stock
 
     if quantity > available_stock:
-        return Response({"message": f"Only {available_stock} items available in stock"}, status=status.HTTP_400_BAD_REQUEST)
+        raise CartAddError(f"Only {available_stock} items available in stock")
+    return variant, variant_unit, available_stock
 
+
+def _eligible_cart_coupon(user, product):
+    """Reuse the project's coupon behavior for main and related cart lines."""
     saved_coupons = SavedCoupon.objects.filter(
-        user=request.user,
-        product=variant.product,
+        user=user,
+        product=product,
     ).select_related("coupon", "coupon__category")
     coupon = None
     for saved_coupon in saved_coupons:
-        current_coupon = get_eligible_coupon(saved_coupon.coupon_id, variant.product)
+        current_coupon = get_eligible_coupon(saved_coupon.coupon_id, product)
         if current_coupon:
             coupon = current_coupon
             break
         SavedCoupon.objects.filter(pk=saved_coupon.pk).delete()
 
-    # A category coupon is dynamic: once the customer applies it to one
-    # product in a category, it can be carried to other eligible products
-    # added to the cart without creating product targets in the coupon.
     if coupon is None:
         category_coupons = SavedCoupon.objects.filter(
-            user=request.user,
+            user=user,
             coupon__applicability_type=Coupon.APPLICABILITY_CATEGORY,
-            coupon__category_id=variant.product.category_id,
+            coupon__category_id=product.category_id,
         ).select_related("coupon", "coupon__category")
         for saved_coupon in category_coupons:
-            current_coupon = get_eligible_coupon(saved_coupon.coupon_id, variant.product)
+            current_coupon = get_eligible_coupon(saved_coupon.coupon_id, product)
             if current_coupon:
                 coupon = current_coupon
                 break
             SavedCoupon.objects.filter(pk=saved_coupon.pk).delete()
 
-    # Usage is scoped to the product. Using the same coupon on another
-    # product must remain possible for the same customer.
     if coupon and CouponUsage.objects.filter(
         coupon=coupon,
-        user=request.user,
-        product=variant.product,
+        user=user,
+        product=product,
     ).exists():
-        coupon = None
+        return None
+    return coupon
 
-    cart_item, created = Cart.objects.get_or_create(
 
-        user=request.user,
-
-        variant=variant,
-
-        variant_unit=variant_unit,
-
-        defaults={
-            "quantity": quantity,
-            "coupon": coupon
-        }
-
+def _add_cart_line(user, variant_id, variant_unit_id, quantity, *, require_variant_unit=False):
+    """Add one validated SKU through the original Cart model and coupon flow."""
+    variant, variant_unit, available_stock = _resolve_cart_variant(
+        variant_id,
+        variant_unit_id,
+        quantity,
+        require_variant_unit=require_variant_unit,
     )
-
+    coupon = _eligible_cart_coupon(user, variant.product)
+    cart_item, created = Cart.objects.get_or_create(
+        user=user,
+        variant=variant,
+        variant_unit=variant_unit,
+        defaults={"quantity": quantity, "coupon": coupon},
+    )
     if not created:
-
         new_quantity = cart_item.quantity + quantity
-
         if new_quantity > available_stock:
-
-            return Response(
-                {
-                    "message":
-                    f"Only {available_stock} items available in stock"
-                },
-                status=status.HTTP_400_BAD_REQUEST
-            )
-
+            raise CartAddError(f"Only {available_stock} items available in stock")
         existing_coupon = _refresh_cart_coupon(cart_item)
         if coupon is None and existing_coupon:
             coupon = existing_coupon
@@ -1224,14 +1197,208 @@ def add_to_cart(request):
         elif cart_item.coupon_id:
             cart_item.coupon = None
         cart_item.save()
+    return cart_item
 
-    return Response(
-        {
-            "message":
-            "Product added to cart successfully"
-        },
-        status=status.HTTP_200_OK
+
+def _related_selection_items(value):
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise CartAddError("related_products must be a list")
+    if len(value) > 4:
+        raise CartAddError("Select no more than four related products")
+    if not all(isinstance(item, dict) for item in value):
+        raise CartAddError("Each related product selection must be an object")
+    return value
+
+
+def _selection_product_id(selection):
+    value = selection.get("product", selection.get("product_id"))
+    try:
+        product_id = int(value)
+    except (TypeError, ValueError):
+        raise CartAddError("Each related product requires a valid product ID")
+    if product_id < 1:
+        raise CartAddError("Each related product requires a valid product ID")
+    return product_id
+
+
+def _add_selected_related_products(user, source_product, selections):
+    """Authorize and add selected upsells using fresh relationship/stock data."""
+    from .related_products import (
+        get_related_products,
+        is_possible_automatic_related_product,
     )
+
+    allowed_products = {product.id: product for product in get_related_products(source_product)}
+    selected_product_ids = []
+    unavailable = []
+    selections_to_add = []
+    requested_ids = [_selection_product_id(selection) for selection in selections]
+    requested_products = Product.objects.in_bulk(requested_ids)
+    for selection in selections:
+        product_id = _selection_product_id(selection)
+        if product_id == source_product.id:
+            raise CartAddError(
+                "One or more selected products are not valid related products.",
+                code="RELATED_PRODUCT_NOT_ALLOWED",
+            )
+        if product_id in selected_product_ids:
+            raise CartAddError("Duplicate related product selections are not allowed.")
+        selected_product_ids.append(product_id)
+
+        # A product can sell out (or be deactivated) after the chooser is
+        # rendered. Treat an actual prior recommendation as unavailable so
+        # the main cart line still succeeds; arbitrary injected IDs remain a
+        # hard authorization error.
+        if product_id not in allowed_products:
+            was_manual_target = (
+                source_product.related_product_mode == Product.RELATED_PRODUCT_MODE_MANUAL
+                and ProductRelatedProduct.objects.filter(
+                    product_id=source_product.id,
+                    related_product_id=product_id,
+                ).exists()
+            )
+            possible_automatic_target = (
+                source_product.related_product_mode == Product.RELATED_PRODUCT_MODE_AUTOMATIC
+                and product_id in requested_products
+                and is_possible_automatic_related_product(
+                    source_product, requested_products[product_id]
+                )
+            )
+            if was_manual_target or possible_automatic_target:
+                unavailable.append(
+                    {"product": product_id, "message": "This related product is no longer available."}
+                )
+                continue
+            raise CartAddError(
+                "One or more selected products are not valid related products.",
+                code="RELATED_PRODUCT_NOT_ALLOWED",
+            )
+        selections_to_add.append((selection, product_id))
+
+    added = []
+    for selection, product_id in selections_to_add:
+        product = allowed_products[product_id]
+        variant_id = selection.get("variant")
+        variant_unit_id = selection.get("variant_size")
+
+        # A default is safe only when this product has exactly one simple,
+        # purchasable variant. Multiple colors or units must be chosen by the
+        # customer; the old cart defaulting behavior is never used here.
+        variants = list(product.variants.all())
+        if not variant_id:
+            if len(variants) == 1 and variants[0].price_type == "single":
+                variant_id = variants[0].id
+            else:
+                raise CartAddError(
+                    "Select a variant option before adding this related product.",
+                    code="RELATED_VARIANT_REQUIRED",
+                )
+
+        try:
+            quantity = _cart_quantity(selection.get("quantity", 1))
+            variant, variant_unit, _ = _resolve_cart_variant(
+                variant_id,
+                variant_unit_id,
+                quantity,
+                require_variant_unit=True,
+            )
+            if variant.product_id != product_id:
+                raise CartAddError("The selected variant does not belong to this related product.")
+            if not variant.product.is_active:
+                raise CartAddError("This related product is no longer available.")
+            _add_cart_line(
+                user,
+                variant.id,
+                variant_unit.id if variant_unit else None,
+                quantity,
+                require_variant_unit=True,
+            )
+            added.append(product_id)
+        except CartAddError as error:
+            # A legitimate recommendation can go out of stock between the
+            # prompt and confirmation. It is skipped without preventing the
+            # already-valid main product from proceeding.
+            if error.code == "RELATED_VARIANT_REQUIRED" or "does not belong" in error.message:
+                raise
+            unavailable.append({"product": product_id, "message": error.message})
+
+    return added, unavailable
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
+def add_to_cart(request):
+    """Existing Cart API, extended with an optional related-product step.
+
+    First call it with the main ``variant`` as before. The response includes
+    up to four chooser cards. Confirm selected cards with ``source_product``
+    and ``related_products`` (or supply ``related_products`` in the initial
+    call when the client already has the choices). No client price is read.
+    """
+    selections = _related_selection_items(request.data.get("related_products"))
+    main_variant_id = request.data.get("variant")
+    source_product_id = request.data.get("source_product", request.data.get("source_product_id"))
+    main_added = False
+
+    try:
+        if main_variant_id:
+            main_quantity = _cart_quantity(request.data.get("quantity", 1))
+            main_variant, _, _ = _resolve_cart_variant(
+                main_variant_id,
+                request.data.get("variant_size"),
+                main_quantity,
+            )
+            source_product = main_variant.product
+            _add_cart_line(
+                request.user,
+                main_variant_id,
+                request.data.get("variant_size"),
+                main_quantity,
+            )
+            main_added = True
+        else:
+            if not source_product_id:
+                raise CartAddError("Variant is required")
+            try:
+                source_product = Product.objects.get(id=int(source_product_id))
+            except (TypeError, ValueError, Product.DoesNotExist):
+                raise CartAddError("Source product not found", status.HTTP_404_NOT_FOUND)
+            if not selections:
+                raise CartAddError("Variant is required")
+            if not Cart.objects.filter(
+                user=request.user, variant__product_id=source_product.id
+            ).exists():
+                raise CartAddError("Add the main product to the cart before selecting related products.")
+
+        added_related, unavailable_related = _add_selected_related_products(
+            request.user,
+            source_product,
+            selections,
+        ) if selections else ([], [])
+    except CartAddError as error:
+        payload = {"message": error.message}
+        if error.code:
+            payload["error_code"] = error.code
+        return Response(payload, status=error.status_code)
+
+    from .related_products import get_related_products
+
+    response = {
+        "message": "Product added to cart successfully" if main_added else "Selected related products added to cart successfully",
+        "related_products_added": added_related,
+        "related_products": (
+            RelatedProductSerializer(get_related_products(source_product), many=True, context={"request": request}).data
+            if main_added and not selections
+            else []
+        ),
+    }
+    if unavailable_related:
+        response["message"] = "Some selected related products are no longer available."
+        response["unavailable_related_products"] = unavailable_related
+    return Response(response, status=status.HTTP_200_OK)
     
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])

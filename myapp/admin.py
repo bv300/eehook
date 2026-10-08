@@ -1,6 +1,7 @@
 import nested_admin
 from django.contrib import admin
 from django import forms
+from django.contrib.admin.widgets import FilteredSelectMultiple
 from django.db import transaction
 from .models import *
 
@@ -112,9 +113,38 @@ class ProductVariantInline( nested_admin.NestedStackedInline ):
     ]
 
 class ProductAdminForm(forms.ModelForm):
+    manual_related_products = forms.ModelMultipleChoiceField(
+        queryset=Product.objects.none(),
+        required=False,
+        widget=FilteredSelectMultiple("Related products", is_stacked=False),
+        help_text="Select up to four active products. The dashboard API preserves the submitted order.",
+    )
+
     class Meta:
         model = Product
         fields = '__all__'
+        # This relationship has an explicit ordered through model, so Django's
+        # generic M2M widget cannot safely save it. The dedicated field above
+        # is the only supported admin editing surface.
+        exclude = ("related_products",)
+        widgets = {
+            "related_product_mode": forms.RadioSelect(
+                choices=Product.RELATED_PRODUCT_MODE_CHOICES
+            ),
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        queryset = Product.objects.filter(is_active=True).order_by("name", "id")
+        if self.instance and self.instance.pk:
+            queryset = queryset.exclude(pk=self.instance.pk)
+            if self.instance.related_product_mode == Product.RELATED_PRODUCT_MODE_MANUAL:
+                self.initial["manual_related_products"] = list(
+                    self.instance.related_product_links.order_by("position", "id").values_list(
+                        "related_product_id", flat=True
+                    )
+                )
+        self.fields["manual_related_products"].queryset = queryset
 
     def clean(self):
         cleaned_data = super().clean()
@@ -126,14 +156,60 @@ class ProductAdminForm(forms.ModelForm):
                 'The subcategory must belong to the selected category.',
             )
 
+        mode = cleaned_data.get("related_product_mode")
+        related_products = list(cleaned_data.get("manual_related_products") or [])
+        if mode == Product.RELATED_PRODUCT_MODE_MANUAL:
+            if len(related_products) > 4:
+                self.add_error(
+                    "manual_related_products",
+                    "Select no more than four related products.",
+                )
+            if self.instance and self.instance.pk in {item.pk for item in related_products}:
+                self.add_error(
+                    "manual_related_products",
+                    "A product cannot be related to itself.",
+                )
+
         return cleaned_data
+
+    def _save_manual_related_products(self, product):
+        if product.related_product_mode != Product.RELATED_PRODUCT_MODE_MANUAL:
+            ProductRelatedProduct.objects.filter(product=product).delete()
+            return
+        related_products = list(self.cleaned_data.get("manual_related_products") or [])
+        ProductRelatedProduct.objects.filter(product=product).delete()
+        ProductRelatedProduct.objects.bulk_create(
+            [
+                ProductRelatedProduct(
+                    product=product,
+                    related_product=related_product,
+                    position=position,
+                )
+                for position, related_product in enumerate(related_products)
+            ]
+        )
+
+    def save(self, commit=True):
+        product = super().save(commit=commit)
+        if commit:
+            self._save_manual_related_products(product)
+            return product
+
+        original_save_m2m = self.save_m2m
+
+        def save_m2m():
+            original_save_m2m()
+            self._save_manual_related_products(product)
+
+        self.save_m2m = save_m2m
+        return product
 
 @admin.register(Product)
 class ProductAdmin(nested_admin.NestedModelAdmin):
     form = ProductAdminForm
     
     class Media:
-        js = ('js/price_toggle.js',)
+        js = ('js/price_toggle.js', 'js/related_products_toggle.js')
 
     def get_form(self, request, obj=None, **kwargs):
         form = super().get_form(request, obj, **kwargs)
@@ -182,6 +258,16 @@ class ProductAdmin(nested_admin.NestedModelAdmin):
 
         ("Promotional & Social",
             {"fields": ("current_viewers_count", "promotional_banner_image", "promotional_banner_link")}
+        ),
+
+        ("Related Products",
+            {
+                "fields": ("related_product_mode", "manual_related_products"),
+                "description": (
+                    "Manual: choose up to four products. Automatic: recommendations are "
+                    "selected from relevant active catalog products. None: no chooser is shown."
+                ),
+            }
         ),
 
         ("Status",

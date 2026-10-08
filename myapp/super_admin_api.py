@@ -33,6 +33,7 @@ from .models import (
     OrderItem,
     Product,
     ProductImage,
+    ProductRelatedProduct,
     ProductVariant,
     ProductVariantUnit,
     PromoBanner,
@@ -114,6 +115,17 @@ class AdminUserSerializer(serializers.ModelSerializer):
 
 
 class AdminProductSerializer(serializers.ModelSerializer):
+    # The order in this list is the display order.  It is intentionally
+    # separate from the read-only relationship payload so a dashboard cannot
+    # write arbitrary through-model fields or a fifth relationship.
+    related_product_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1),
+        write_only=True,
+        required=False,
+        max_length=4,
+    )
+    manual_related_products = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
         model = Product
         fields = (
@@ -135,6 +147,9 @@ class AdminProductSerializer(serializers.ModelSerializer):
             "current_viewers_count",
             "promotional_banner_image",
             "promotional_banner_link",
+            "related_product_mode",
+            "related_product_ids",
+            "manual_related_products",
         )
         read_only_fields = ("id", "created_at", "updated_at")
 
@@ -148,19 +163,79 @@ class AdminProductSerializer(serializers.ModelSerializer):
                 {"subcategory": "The subcategory must belong to the selected category."}
             )
 
+        related_ids = attrs.get("related_product_ids")
+        mode = attrs.get(
+            "related_product_mode",
+            getattr(self.instance, "related_product_mode", Product.RELATED_PRODUCT_MODE_NONE),
+        )
+        if related_ids is not None:
+            if len(set(related_ids)) != len(related_ids):
+                raise serializers.ValidationError(
+                    {"related_product_ids": "Duplicate related products are not allowed."}
+                )
+            if self.instance and self.instance.pk in related_ids:
+                raise serializers.ValidationError(
+                    {"related_product_ids": "A product cannot be related to itself."}
+                )
+            valid_count = Product.objects.filter(
+                id__in=related_ids,
+                is_active=True,
+            ).count()
+            if valid_count != len(related_ids):
+                raise serializers.ValidationError(
+                    {"related_product_ids": "Related products must be active existing products."}
+                )
+            if mode != Product.RELATED_PRODUCT_MODE_MANUAL and related_ids:
+                raise serializers.ValidationError(
+                    {"related_product_ids": "Manual related products require Manual mode."}
+                )
+
         return attrs
 
+    @staticmethod
+    def _sync_manual_related_products(product, related_ids):
+        ProductRelatedProduct.objects.filter(product=product).delete()
+        ProductRelatedProduct.objects.bulk_create(
+            [
+                ProductRelatedProduct(
+                    product=product,
+                    related_product_id=related_product_id,
+                    position=position,
+                )
+                for position, related_product_id in enumerate(related_ids)
+            ]
+        )
+
+    def get_manual_related_products(self, obj):
+        links = list(obj.related_product_links.all())
+        return [
+            {
+                "id": link.related_product_id,
+                "name": link.related_product.name,
+                "position": link.position,
+            }
+            for link in links
+        ]
+
     def create(self, validated_data):
+        related_ids = validated_data.pop("related_product_ids", None)
         instance = Product(**validated_data)
         instance.full_clean()
         instance.save()
+        if instance.related_product_mode == Product.RELATED_PRODUCT_MODE_MANUAL and related_ids:
+            self._sync_manual_related_products(instance, related_ids)
         return instance
 
     def update(self, instance, validated_data):
+        related_ids = validated_data.pop("related_product_ids", None)
         for field, value in validated_data.items():
             setattr(instance, field, value)
         instance.full_clean()
         instance.save()
+        if instance.related_product_mode != Product.RELATED_PRODUCT_MODE_MANUAL:
+            ProductRelatedProduct.objects.filter(product=instance).delete()
+        elif related_ids is not None:
+            self._sync_manual_related_products(instance, related_ids)
         return instance
 
 
@@ -473,7 +548,11 @@ class AdminRegionViewSet(AdminModelViewSet):
 
 
 class AdminProductViewSet(AdminModelViewSet):
-    queryset = Product.objects.select_related("category", "subcategory", "brand", "offer").all()
+    queryset = Product.objects.select_related(
+        "category", "subcategory", "brand", "offer"
+    ).prefetch_related(
+        "related_product_links__related_product"
+    ).all()
     serializer_class = AdminProductSerializer
     # Product identifiers live on the product's variants in the current
     # schema: variant SKUs are also the catalog/product codes, while
