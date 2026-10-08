@@ -445,6 +445,115 @@ class CouponAdmin(admin.ModelAdmin):
         return "-"
     copy_code_button.short_description = "Copy Code"
 
+
+@admin.register(WelcomeBonus)
+class WelcomeBonusAdmin(admin.ModelAdmin):
+    """A separate admin section; redemption codes are never listed here."""
+
+    class WelcomeBonusAdminForm(forms.ModelForm):
+        class Meta:
+            model = WelcomeBonus
+            fields = "__all__"
+
+        def clean(self):
+            cleaned = super().clean()
+            applicability = cleaned.get("applicability_type")
+            products = cleaned.get("products")
+            category = cleaned.get("category")
+            if applicability == WelcomeBonus.APPLICABILITY_PRODUCT and not products:
+                self.add_error("products", "Select at least one product for a product-wise welcome bonus.")
+            if applicability == WelcomeBonus.APPLICABILITY_CATEGORY:
+                if not category:
+                    self.add_error("category", "A category is required for a category-wise welcome bonus.")
+                if products:
+                    self.add_error("products", "Category-wise welcome bonuses must not contain product targets.")
+            return cleaned
+
+    form = WelcomeBonusAdminForm
+    list_display = (
+        "name",
+        "applicability_type",
+        "welcome_bonus_target",
+        "discount_type",
+        "discount_value",
+        "start_date",
+        "end_date",
+        "is_active",
+        "assigned_count",
+        "claimed_count",
+        "redeemed_count",
+    )
+    list_filter = ("applicability_type", "discount_type", "is_active", "start_date", "end_date")
+    search_fields = ("name", "products__name", "category__name")
+    autocomplete_fields = ("products", "category")
+    readonly_fields = ("archived_at", "created_at", "updated_at")
+
+    @admin.display(description="Target")
+    def welcome_bonus_target(self, obj):
+        if obj.applicability_type == WelcomeBonus.APPLICABILITY_CATEGORY:
+            return obj.category.name if obj.category else "-"
+        return ", ".join(obj.products.values_list("name", flat=True)[:3])
+
+    @admin.display(description="Discount")
+    def discount_value(self, obj):
+        return obj.fixed_amount if obj.discount_type == WelcomeBonus.DISCOUNT_FIXED else f"{obj.discount_percentage}%"
+
+    @admin.display(description="Assigned")
+    def assigned_count(self, obj):
+        return obj.assignments.count()
+
+    @admin.display(description="Claimed")
+    def claimed_count(self, obj):
+        return obj.assignments.filter(
+            status__in=(
+                WelcomeBonusAssignment.STATUS_CLAIMED,
+                WelcomeBonusAssignment.STATUS_REDEEMED,
+            )
+        ).count()
+
+    @admin.display(description="Redeemed")
+    def redeemed_count(self, obj):
+        return obj.assignments.filter(status=WelcomeBonusAssignment.STATUS_REDEEMED).count()
+
+    def delete_model(self, request, obj):
+        # Mirror the dashboard's archival delete and retain order history.
+        from django.utils import timezone
+
+        obj.is_active = False
+        obj.archived_at = timezone.now()
+        obj.save(update_fields=("is_active", "archived_at", "updated_at"))
+
+    def delete_queryset(self, request, queryset):
+        from django.utils import timezone
+
+        now = timezone.now()
+        queryset.update(is_active=False, archived_at=now, updated_at=now)
+
+
+@admin.register(WelcomeBonusRedemption)
+class WelcomeBonusRedemptionAdmin(admin.ModelAdmin):
+    list_display = ("order", "user", "welcome_bonus", "promotion_type", "applied_amount", "redeemed_at")
+    list_filter = ("promotion_type", "redeemed_at")
+    search_fields = ("user__email", "welcome_bonus__name", "order__id")
+    fields = (
+        "assignment",
+        "order",
+        "user",
+        "welcome_bonus",
+        "promotion_type",
+        "discount_type",
+        "discount_value",
+        "applied_amount",
+        "redeemed_at",
+    )
+    readonly_fields = fields
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
 @admin.register(CouponUsage)
 class CouponUsageAdmin(admin.ModelAdmin):
     list_display = ('user', 'coupon', 'product', 'used_at')

@@ -510,6 +510,13 @@ class Cart(models.Model):
     variant_unit = models.ForeignKey( ProductVariantUnit,on_delete=models.CASCADE, null=True, blank=True)
     quantity = models.PositiveIntegerField( default=1)
     coupon = models.ForeignKey('Coupon', on_delete=models.SET_NULL, null=True, blank=True)
+    welcome_bonus_assignment = models.ForeignKey(
+        "WelcomeBonusAssignment",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="cart_items",
+    )
     created_at = models.DateTimeField( auto_now_add=True )
 
     class Meta:
@@ -517,6 +524,15 @@ class Cart(models.Model):
             "user",
             "variant",
             "variant_unit"
+        )
+        constraints = (
+            models.CheckConstraint(
+                condition=(
+                    models.Q(coupon__isnull=True)
+                    | models.Q(welcome_bonus_assignment__isnull=True)
+                ),
+                name="myapp_cart_one_promotion_source",
+            ),
         )
 
     def __str__(self):
@@ -900,7 +916,10 @@ class Coupon(models.Model):
             import string, random
             while True:
                 code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
-                if not Coupon.objects.filter(code=code).exists():
+                if (
+                    not Coupon.objects.filter(code=code).exists()
+                    and not WelcomeBonusAssignment.objects.filter(code=code).exists()
+                ):
                     self.code = code
                     break
         self.full_clean()
@@ -967,3 +986,279 @@ class SavedCoupon(models.Model):
 
     def __str__(self):
         return f"{self.user.email} saved {self.coupon.code} for {self.product.name}"
+
+
+class WelcomeBonus(models.Model):
+    """An admin-managed welcome-bonus campaign.
+
+    A campaign deliberately does not have a public redemption code. Codes
+    live on ``WelcomeBonusAssignment``, one per customer, so a code can never
+    be shared between customers.
+    """
+
+    APPLICABILITY_PRODUCT = "PRODUCT"
+    APPLICABILITY_CATEGORY = "CATEGORY"
+    APPLICABILITY_CHOICES = (
+        (APPLICABILITY_PRODUCT, "Product"),
+        (APPLICABILITY_CATEGORY, "Category"),
+    )
+    DISCOUNT_PERCENTAGE = "PERCENTAGE"
+    DISCOUNT_FIXED = "FIXED"
+    DISCOUNT_TYPE_CHOICES = (
+        (DISCOUNT_PERCENTAGE, "Percentage"),
+        (DISCOUNT_FIXED, "Fixed Amount"),
+    )
+
+    name = models.CharField(max_length=200)
+    products = models.ManyToManyField(
+        Product,
+        blank=True,
+        related_name="welcome_bonuses",
+        help_text="Select the eligible products for a product-wise campaign.",
+    )
+    category = models.ForeignKey(
+        Category,
+        on_delete=models.PROTECT,
+        null=True,
+        blank=True,
+        related_name="welcome_bonuses",
+    )
+    applicability_type = models.CharField(
+        max_length=20,
+        choices=APPLICABILITY_CHOICES,
+        default=APPLICABILITY_PRODUCT,
+    )
+    discount_type = models.CharField(
+        max_length=20,
+        choices=DISCOUNT_TYPE_CHOICES,
+        default=DISCOUNT_PERCENTAGE,
+    )
+    discount_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    fixed_amount = models.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        null=True,
+        blank=True,
+    )
+    start_date = models.DateTimeField()
+    end_date = models.DateTimeField()
+    is_active = models.BooleanField(default=True)
+    # Deletion is archival. It preserves redemptions and historical orders.
+    archived_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ("-created_at", "-id")
+        constraints = (
+            models.CheckConstraint(
+                condition=models.Q(end_date__gt=models.F("start_date")),
+                name="myapp_welcome_bonus_valid_dates",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        discount_type="PERCENTAGE",
+                        discount_percentage__gt=0,
+                        discount_percentage__lte=100,
+                        fixed_amount__isnull=True,
+                    )
+                    | models.Q(
+                        discount_type="FIXED",
+                        fixed_amount__gt=0,
+                        discount_percentage__isnull=True,
+                    )
+                ),
+                name="myapp_welcome_bonus_valid_discount",
+            ),
+        )
+
+    def clean(self):
+        super().clean()
+        errors = {}
+        if self.start_date and self.end_date and self.start_date >= self.end_date:
+            errors["end_date"] = "Expiry date must be after the start date."
+        if self.applicability_type == self.APPLICABILITY_CATEGORY and not self.category_id:
+            errors["category"] = "A category is required for a category-wise welcome bonus."
+        if self.applicability_type == self.APPLICABILITY_PRODUCT and self.category_id:
+            errors["category"] = "Category must be empty for a product-wise welcome bonus."
+        if self.discount_type == self.DISCOUNT_PERCENTAGE:
+            if self.discount_percentage is None or not (0 < self.discount_percentage <= 100):
+                errors["discount_percentage"] = "Percentage must be greater than 0 and at most 100."
+            if self.fixed_amount is not None:
+                errors["fixed_amount"] = "Fixed amount must be empty for a percentage discount."
+        elif self.discount_type == self.DISCOUNT_FIXED:
+            if self.fixed_amount is None or self.fixed_amount <= 0:
+                errors["fixed_amount"] = "Fixed amount must be greater than 0."
+            if self.discount_percentage is not None:
+                errors["discount_percentage"] = "Percentage must be empty for a fixed amount discount."
+        else:
+            errors["discount_type"] = "Select Percentage or Fixed Amount."
+        if errors:
+            raise ValidationError(errors)
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def is_currently_redeemable(self):
+        from django.utils import timezone
+
+        now = timezone.now()
+        return bool(
+            self.is_active
+            and self.archived_at is None
+            and self.start_date <= now <= self.end_date
+        )
+
+
+class WelcomeBonusAssignment(models.Model):
+    """The private, user-specific entitlement for a welcome-bonus campaign."""
+
+    STATUS_AVAILABLE = "AVAILABLE"
+    STATUS_CLAIMED = "CLAIMED"
+    STATUS_REDEEMED = "REDEEMED"
+    STATUS_CHOICES = (
+        (STATUS_AVAILABLE, "Available"),
+        (STATUS_CLAIMED, "Claimed"),
+        (STATUS_REDEEMED, "Redeemed"),
+    )
+
+    welcome_bonus = models.ForeignKey(
+        WelcomeBonus,
+        on_delete=models.PROTECT,
+        related_name="assignments",
+    )
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="welcome_bonus_assignments",
+    )
+    # Intentionally omitted from notification and admin serializers.
+    code = models.CharField(max_length=64, unique=True, editable=False)
+    status = models.CharField(
+        max_length=12,
+        choices=STATUS_CHOICES,
+        default=STATUS_AVAILABLE,
+    )
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    redeemed_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = (
+            models.UniqueConstraint(
+                fields=("welcome_bonus", "user"),
+                name="myapp_welcome_bonus_one_assignment_per_user",
+            ),
+        )
+        indexes = (
+            models.Index(fields=("user", "status")),
+        )
+
+    def __str__(self):
+        return f"{self.welcome_bonus_id} assigned to {self.user_id}"
+
+
+class WelcomeBonusNotification(models.Model):
+    """A backend-owned notification for a welcome-bonus assignment."""
+
+    assignment = models.OneToOneField(
+        WelcomeBonusAssignment,
+        on_delete=models.CASCADE,
+        related_name="notification",
+    )
+    read_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at", "-id")
+
+
+class WelcomeBonusApplication(models.Model):
+    """Records a product application without consuming the bonus yet."""
+
+    assignment = models.ForeignKey(
+        WelcomeBonusAssignment,
+        on_delete=models.CASCADE,
+        related_name="applications",
+    )
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name="welcome_bonus_applications",
+    )
+    applied_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = (
+            models.UniqueConstraint(
+                fields=("assignment", "product"),
+                name="myapp_welcome_bonus_one_application_per_product",
+            ),
+        )
+
+
+class SavedWelcomeBonus(models.Model):
+    """The cart-safe equivalent of SavedCoupon for a private bonus code."""
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name="saved_welcome_bonuses",
+    )
+    assignment = models.ForeignKey(
+        WelcomeBonusAssignment,
+        on_delete=models.CASCADE,
+        related_name="saved_products",
+    )
+    product = models.ForeignKey(
+        Product,
+        on_delete=models.CASCADE,
+        related_name="saved_welcome_bonuses",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = (
+            models.UniqueConstraint(
+                fields=("user", "product"),
+                name="myapp_saved_welcome_bonus_per_product",
+            ),
+        )
+
+
+class WelcomeBonusRedemption(models.Model):
+    """Immutable promotion snapshot attached to the order history."""
+
+    PROMOTION_TYPE = "WELCOME_BONUS"
+
+    assignment = models.OneToOneField(
+        WelcomeBonusAssignment,
+        on_delete=models.PROTECT,
+        related_name="redemption",
+    )
+    order = models.ForeignKey(
+        Order,
+        on_delete=models.PROTECT,
+        related_name="welcome_bonus_redemptions",
+    )
+    user = models.ForeignKey(User, on_delete=models.PROTECT, related_name="welcome_bonus_redemptions")
+    welcome_bonus = models.ForeignKey(WelcomeBonus, on_delete=models.PROTECT, related_name="redemptions")
+    promotion_type = models.CharField(max_length=32, default=PROMOTION_TYPE, editable=False)
+    redemption_code = models.CharField(max_length=64, editable=False)
+    discount_type = models.CharField(max_length=20)
+    discount_value = models.DecimalField(max_digits=10, decimal_places=2)
+    applied_amount = models.DecimalField(max_digits=10, decimal_places=2)
+    redeemed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        indexes = (
+            models.Index(fields=("order", "promotion_type")),
+        )

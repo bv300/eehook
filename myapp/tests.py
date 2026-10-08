@@ -46,6 +46,10 @@ from .models import (
     UnitType,
     User,
     Wishlist,
+    WelcomeBonus,
+    WelcomeBonusAssignment,
+    WelcomeBonusNotification,
+    WelcomeBonusRedemption,
 )
 
 
@@ -1649,3 +1653,248 @@ class RelatedProductsTests(TestCase):
         )
         self.assertEqual(disabled.status_code, 200, disabled.data)
         self.assertFalse(ProductRelatedProduct.objects.filter(product=self.main).exists())
+
+
+@override_settings(SECURE_SSL_REDIRECT=False)
+class WelcomeBonusFlowTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.customer = User.objects.create_user(
+            email="welcome-customer@example.invalid",
+            password="WelcomePass123!",
+            role="Customer",
+        )
+        self.other_customer = User.objects.create_user(
+            email="other-welcome-customer@example.invalid",
+            password="WelcomePass123!",
+            role="Customer",
+        )
+        self.admin = User.objects.create_superuser(
+            email="welcome-admin@example.invalid",
+            password="WelcomeAdminPass123!",
+        )
+        self.category = Category.objects.create(name="Welcome footwear", image="footwear.jpg")
+        self.other_category = Category.objects.create(name="Welcome electronics", image="electronics.jpg")
+        self.subcategory = SubCategory.objects.create(
+            category=self.category, name="Welcome shoes"
+        )
+        self.other_subcategory = SubCategory.objects.create(
+            category=self.other_category, name="Welcome phones"
+        )
+        self.product = Product.objects.create(
+            category=self.category,
+            subcategory=self.subcategory,
+            name="Welcome shoe",
+            description="Eligible welcome-bonus product.",
+        )
+        self.other_product = Product.objects.create(
+            category=self.other_category,
+            subcategory=self.other_subcategory,
+            name="Welcome phone",
+            description="Ineligible welcome-bonus product.",
+        )
+        self.variant = ProductVariant.objects.create(
+            product=self.product, price_type="single", price=Decimal("100.00"), stock=5
+        )
+        self.other_variant = ProductVariant.objects.create(
+            product=self.other_product, price_type="single", price=Decimal("100.00"), stock=5
+        )
+        now = timezone.now()
+        self.bonus = WelcomeBonus.objects.create(
+            name="Welcome 10",
+            applicability_type=WelcomeBonus.APPLICABILITY_PRODUCT,
+            discount_type=WelcomeBonus.DISCOUNT_PERCENTAGE,
+            discount_percentage=Decimal("10.00"),
+            start_date=now - timedelta(minutes=1),
+            end_date=now + timedelta(days=1),
+            is_active=True,
+        )
+        self.bonus.products.add(self.product)
+        self.assignment = WelcomeBonusAssignment.objects.get(
+            welcome_bonus=self.bonus, user=self.customer
+        )
+        self.other_assignment = WelcomeBonusAssignment.objects.get(
+            welcome_bonus=self.bonus, user=self.other_customer
+        )
+        self.notification = WelcomeBonusNotification.objects.get(assignment=self.assignment)
+        self.client.force_authenticate(user=self.customer)
+
+    def claim_and_copy(self):
+        claimed = self.client.post(
+            f"/welcome-bonus-notifications/{self.notification.id}/claim/", format="json"
+        )
+        self.assertEqual(claimed.status_code, 200, claimed.data)
+        self.assertNotIn("code", claimed.data)
+        copied = self.client.post(
+            f"/welcome-bonus-notifications/{self.notification.id}/copy-code/", format="json"
+        )
+        self.assertEqual(copied.status_code, 200, copied.data)
+        self.assertEqual(copied["Cache-Control"], "no-store, private")
+        return copied.data["code"]
+
+    def test_assignment_notification_is_masked_and_codes_are_unique(self):
+        self.assertNotEqual(self.assignment.code, self.other_assignment.code)
+        self.assertTrue(self.assignment.code.startswith("WB-"))
+        response = self.client.get("/welcome-bonus-notifications/")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["unread_count"], 1)
+        payload = response.data["notifications"][0]
+        self.assertEqual(payload["masked_code"], "••••••••••••••••")
+        self.assertNotIn("code", payload)
+        self.assertNotIn(self.assignment.code, str(payload))
+
+    def test_claim_and_copy_keep_code_hidden_until_clipboard_endpoint(self):
+        blocked = self.client.post(
+            f"/welcome-bonus-notifications/{self.notification.id}/copy-code/", format="json"
+        )
+        self.assertEqual(blocked.status_code, 400)
+        self.assertEqual(blocked.data["error_code"], "WELCOME_BONUS_NOT_CLAIMED")
+        code = self.claim_and_copy()
+        self.assertEqual(code, self.assignment.code)
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.status, WelcomeBonusAssignment.STATUS_CLAIMED)
+
+    def test_existing_coupon_endpoint_resolves_user_bonus_by_database_ownership(self):
+        code = self.claim_and_copy()
+        applied = self.client.post(
+            "/validate-coupon/",
+            {"code": code, "product_id": self.product.id},
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200, applied.data)
+        self.assertEqual(applied.data["promotion_type"], "WELCOME_BONUS")
+        self.assertNotIn("code", applied.data)
+
+        added = self.client.post(
+            "/cart/add/", {"variant": self.variant.id, "quantity": 1}, format="json"
+        )
+        self.assertEqual(added.status_code, 200, added.data)
+        cart = Cart.objects.get(user=self.customer, variant=self.variant)
+        self.assertEqual(cart.welcome_bonus_assignment_id, self.assignment.id)
+        self.assertIsNone(cart.coupon_id)
+        self.assertEqual(self.client.get("/cart/").data["items"][0]["coupon_code"], None)
+
+    def test_code_is_user_specific_and_product_eligibility_is_enforced(self):
+        self.client.force_authenticate(user=self.other_customer)
+        ownership = self.client.post(
+            "/validate-coupon/",
+            {"code": self.assignment.code, "product_id": self.product.id},
+            format="json",
+        )
+        self.assertEqual(ownership.status_code, 400, ownership.data)
+        self.assertEqual(ownership.data["error_code"], "WELCOME_BONUS_NOT_ASSIGNED_TO_USER")
+
+        self.client.force_authenticate(user=self.customer)
+        code = self.claim_and_copy()
+        ineligible = self.client.post(
+            "/validate-coupon/",
+            {"code": code, "product_id": self.other_product.id},
+            format="json",
+        )
+        self.assertEqual(ineligible.status_code, 400, ineligible.data)
+        self.assertEqual(ineligible.data["error_code"], "WELCOME_BONUS_NOT_APPLICABLE")
+
+    def test_order_redeems_bonus_and_admin_deactivation_invalidates_cart(self):
+        code = self.claim_and_copy()
+        self.assertEqual(
+            self.client.post(
+                "/validate-coupon/",
+                {"code": code, "product_id": self.product.id},
+                format="json",
+            ).status_code,
+            200,
+        )
+        self.client.post("/cart/add/", {"variant": self.variant.id, "quantity": 1}, format="json")
+        address = Address.objects.create(
+            user=self.customer,
+            full_name="Welcome Customer",
+            phone="123456789",
+            address_line="1 Welcome Way",
+            city="Auckland",
+            postal_code="1010",
+        )
+        ordered = self.client.post("/place-order/", {"address": address.id}, format="json")
+        self.assertEqual(ordered.status_code, 201, ordered.data)
+        self.assignment.refresh_from_db()
+        self.assertEqual(self.assignment.status, WelcomeBonusAssignment.STATUS_REDEEMED)
+        self.assertTrue(WelcomeBonusRedemption.objects.filter(assignment=self.assignment).exists())
+
+        # A fresh assignment is detached from cart when the campaign is
+        # deactivated, proving totals are revalidated server-side.
+        follow_up = WelcomeBonus.objects.create(
+            name="Inactive check",
+            applicability_type=WelcomeBonus.APPLICABILITY_PRODUCT,
+            discount_type=WelcomeBonus.DISCOUNT_FIXED,
+            fixed_amount=Decimal("5.00"),
+            start_date=timezone.now() - timedelta(minutes=1),
+            end_date=timezone.now() + timedelta(days=1),
+        )
+        follow_up.products.add(self.product)
+        follow_assignment = WelcomeBonusAssignment.objects.get(
+            welcome_bonus=follow_up, user=self.customer
+        )
+        follow_assignment.status = WelcomeBonusAssignment.STATUS_CLAIMED
+        follow_assignment.claimed_at = timezone.now()
+        follow_assignment.save()
+        Cart.objects.create(
+            user=self.customer,
+            variant=self.variant,
+            quantity=1,
+            welcome_bonus_assignment=follow_assignment,
+        )
+        follow_up.is_active = False
+        follow_up.save(update_fields=("is_active",))
+        self.client.get("/cart/")
+        self.assertIsNone(Cart.objects.get(user=self.customer, variant=self.variant).welcome_bonus_assignment_id)
+
+    def test_category_bonus_applies_to_category_but_not_unrelated_products(self):
+        category_bonus = WelcomeBonus.objects.create(
+            name="Footwear welcome bonus",
+            applicability_type=WelcomeBonus.APPLICABILITY_CATEGORY,
+            category=self.category,
+            discount_type=WelcomeBonus.DISCOUNT_FIXED,
+            fixed_amount=Decimal("20.00"),
+            start_date=timezone.now() - timedelta(minutes=1),
+            end_date=timezone.now() + timedelta(days=1),
+        )
+        category_assignment = WelcomeBonusAssignment.objects.get(
+            welcome_bonus=category_bonus, user=self.customer
+        )
+        notification = WelcomeBonusNotification.objects.get(assignment=category_assignment)
+        self.assertEqual(
+            self.client.post(
+                f"/welcome-bonus-notifications/{notification.id}/claim/", format="json"
+            ).status_code,
+            200,
+        )
+        code = self.client.post(
+            f"/welcome-bonus-notifications/{notification.id}/copy-code/", format="json"
+        ).data["code"]
+        self.assertEqual(
+            self.client.post(
+                "/validate-coupon/",
+                {"code": code, "product_id": self.product.id},
+                format="json",
+            ).status_code,
+            200,
+        )
+        rejected = self.client.post(
+            "/validate-coupon/",
+            {"code": code, "product_id": self.other_product.id},
+            format="json",
+        )
+        self.assertEqual(rejected.status_code, 400, rejected.data)
+        self.assertEqual(rejected.data["error_code"], "WELCOME_BONUS_NOT_APPLICABLE")
+
+    def test_admin_api_is_separate_and_protected(self):
+        self.client.force_authenticate(user=self.customer)
+        self.assertEqual(self.client.get("/admin/manage/welcome-bonuses/").status_code, 403)
+        self.client.force_authenticate(user=self.admin)
+        listed = self.client.get("/admin/manage/welcome-bonuses/")
+        self.assertEqual(listed.status_code, 200, listed.data)
+        self.assertEqual(listed.data["results"][0]["assigned_user_count"], 2)
+        toggled = self.client.post(
+            f"/admin/manage/welcome-bonuses/{self.bonus.id}/toggle-active/", format="json"
+        )
+        self.assertEqual(toggled.status_code, 200, toggled.data)
+        self.assertFalse(toggled.data["is_active"])

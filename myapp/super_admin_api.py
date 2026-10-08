@@ -45,6 +45,7 @@ from .models import (
     User,
     UserProfile,
     Wishlist,
+    WelcomeBonus,
 )
 from .permissions import IsSuperAdmin
 from .catalog_pricing import get_product_price_values
@@ -856,6 +857,7 @@ ADMIN_RESOURCES = (
     ("promo-banners", PromoBanner, "admin/manage/promo-banners/"),
     ("hero-side-banners", HeroSideBanner, "admin/manage/hero-side-banners/"),
     ("coupons", Coupon, "admin/manage/coupons/"),
+    ("welcome-bonuses", WelcomeBonus, "admin/manage/welcome-bonuses/"),
     ("coupon-usages", CouponUsage, "admin/manage/coupon-usages/"),
 )
 

@@ -24,6 +24,8 @@ from myapp.models import (
     ProductVariant,
     ProductVariantUnit,
     SavedCoupon,
+    SavedWelcomeBonus,
+    WelcomeBonusAssignment,
 )
 from myapp.whatsapp import send_owner_order_notification
 
@@ -32,6 +34,11 @@ from myapp.utils import (
     calculate_order_total,
     calculate_coupon_price,
     get_eligible_coupon,
+)
+from myapp.welcome_bonus import (
+    calculate_welcome_bonus_price,
+    get_eligible_welcome_bonus_assignment,
+    redeem_welcome_bonus_assignment,
 )
 
 from .services import StripeService
@@ -91,6 +98,7 @@ def create_checkout_session(request):
             "variant__color",
             "variant_unit",
             "variant_unit__unit",
+            "welcome_bonus_assignment",
         )
     )
 
@@ -145,11 +153,35 @@ def create_checkout_session(request):
             item.variant.product.offer
         )
 
+        welcome_bonus_assignment_id = item.welcome_bonus_assignment_id
+        welcome_bonus_assignment = get_eligible_welcome_bonus_assignment(
+            welcome_bonus_assignment_id,
+            request.user,
+            item.variant.product,
+        )
         coupon_id = item.coupon_id
-        coupon = get_eligible_coupon(coupon_id, item.variant.product)
+        coupon = None
+        if welcome_bonus_assignment:
+            discounted_price = calculate_welcome_bonus_price(
+                discounted_price,
+                welcome_bonus_assignment,
+            )
+        elif welcome_bonus_assignment_id:
+            Cart.objects.filter(
+                pk=item.pk,
+                welcome_bonus_assignment_id=welcome_bonus_assignment_id,
+            ).update(welcome_bonus_assignment=None)
+            SavedWelcomeBonus.objects.filter(
+                user=request.user,
+                product=item.variant.product,
+                assignment_id=welcome_bonus_assignment_id,
+            ).delete()
+            item.welcome_bonus_assignment = None
+        else:
+            coupon = get_eligible_coupon(coupon_id, item.variant.product)
         if coupon:
             discounted_price = calculate_coupon_price(discounted_price, coupon)
-        elif coupon_id:
+        elif coupon_id and not welcome_bonus_assignment:
             Cart.objects.filter(
                 pk=item.pk,
                 coupon_id=coupon_id,
@@ -195,6 +227,11 @@ def create_checkout_session(request):
                             "variant_id": str(item.variant_id),
                             "variant_unit_id": str(item.variant_unit_id or ""),
                             "coupon_id": str(coupon.id if coupon else ""),
+                            "welcome_bonus_assignment_id": str(
+                                welcome_bonus_assignment.id
+                                if welcome_bonus_assignment
+                                else ""
+                            ),
                             "original_price": str(original_price),
                             "discount_amount": str(discount_amount),
                             "discounted_price": str(discounted_price),
@@ -453,6 +490,11 @@ def fulfill_paid_order(session):
                 "variant_unit_id": int(variant_unit_id) if variant_unit_id else None,
                 "variant_id": int(variant_id) if variant_id else None,
                 "coupon_id": int(metadata["coupon_id"]) if metadata.get("coupon_id") else None,
+                "welcome_bonus_assignment_id": (
+                    int(metadata["welcome_bonus_assignment_id"])
+                    if metadata.get("welcome_bonus_assignment_id")
+                    else None
+                ),
                 "quantity": quantity,
                 "original_price": Decimal(
                     metadata.get("original_price", "0")
@@ -582,6 +624,21 @@ def fulfill_paid_order(session):
         )
     }
 
+    welcome_bonus_assignment_ids = {
+        snapshot["welcome_bonus_assignment_id"]
+        for snapshot in product_snapshots
+        if snapshot.get("welcome_bonus_assignment_id")
+    }
+    locked_welcome_bonus_assignments = {
+        assignment.id: assignment
+        for assignment in (
+            WelcomeBonusAssignment.objects.select_for_update()
+            .select_related("welcome_bonus", "user")
+            .prefetch_related("welcome_bonus__products")
+            .filter(id__in=welcome_bonus_assignment_ids)
+        )
+    }
+
 
     # =====================================================
     # CHECK STOCK AGAIN
@@ -618,6 +675,48 @@ def fulfill_paid_order(session):
         selected_variant = variant_unit.variant if variant_unit else variant
         if not get_eligible_coupon(snapshot["coupon_id"], selected_variant.product):
             raise ValueError("Coupon is no longer active. Please retry checkout.")
+
+    # Revalidate the private entitlement, ownership, campaign state and the
+    # calculated server-side price immediately before creating the order. A
+    # change after the Stripe session was opened must not consume the code.
+    welcome_bonus_amounts = {}
+    for snapshot in product_snapshots:
+        assignment_id = snapshot.get("welcome_bonus_assignment_id")
+        if not assignment_id:
+            continue
+        assignment = locked_welcome_bonus_assignments.get(assignment_id)
+        if not assignment or assignment.user_id != user_id:
+            raise ValueError("Welcome bonus is no longer available. Please retry checkout.")
+        variant_unit = locked_sizes.get(snapshot["variant_unit_id"])
+        variant = locked_variants.get(snapshot["variant_id"])
+        selected_variant = variant_unit.variant if variant_unit else variant
+        assignment = get_eligible_welcome_bonus_assignment(
+            assignment,
+            assignment.user,
+            selected_variant.product,
+        )
+        if not assignment:
+            raise ValueError("Welcome bonus is no longer active. Please retry checkout.")
+        current_original_price = (
+            variant_unit.price if variant_unit else selected_variant.price
+        )
+        current_offer_price = calculate_offer_price(
+            current_original_price,
+            selected_variant.product.offer,
+        )
+        current_discounted_price = calculate_welcome_bonus_price(
+            current_offer_price,
+            assignment,
+        )
+        if (
+            current_discounted_price != snapshot["price"]
+            or current_original_price != snapshot["original_price"]
+        ):
+            raise ValueError("Welcome bonus price changed. Please retry checkout.")
+        welcome_bonus_amounts[assignment.id] = (
+            welcome_bonus_amounts.get(assignment.id, Decimal("0.00"))
+            + (current_offer_price - current_discounted_price) * snapshot["quantity"]
+        )
 
 
     # =====================================================
@@ -698,6 +797,11 @@ def fulfill_paid_order(session):
         stock_record = variant_unit or variant
         stock_record.stock -= snapshot["quantity"]
         stock_record.save(update_fields=["stock"])
+
+    for assignment_id, applied_amount in welcome_bonus_amounts.items():
+        assignment = locked_welcome_bonus_assignments.get(assignment_id)
+        if assignment:
+            redeem_welcome_bonus_assignment(assignment, order, applied_amount)
 
 
     # =====================================================

@@ -6,6 +6,11 @@ from django.contrib.auth.password_validation import validate_password
 from django.core.exceptions import ValidationError as DjangoValidationError
 from .models import *
 from .utils import *    
+from .welcome_bonus import (
+    get_eligible_welcome_bonus_assignment,
+    calculate_welcome_bonus_price,
+    welcome_bonus_validation_error,
+)
 
 class RegisterSerializer(serializers.ModelSerializer):
 
@@ -477,6 +482,8 @@ class CartSerializer(serializers.ModelSerializer):
 
     coupon_status = serializers.SerializerMethodField()
 
+    promotion_type = serializers.SerializerMethodField()
+
     quantity = serializers.IntegerField(
         read_only=True
     )
@@ -505,6 +512,7 @@ class CartSerializer(serializers.ModelSerializer):
             "coupon_code",
             "coupon_discount_type",
             "coupon_status",
+            "promotion_type",
             "quantity",
             "stock",
             "total_price",
@@ -546,9 +554,17 @@ class CartSerializer(serializers.ModelSerializer):
             price,
             obj.variant.product.offer
         )
-        coupon = get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product)
-        if coupon:
-            dp = calculate_coupon_price(dp, coupon)
+        welcome_bonus = get_eligible_welcome_bonus_assignment(
+            getattr(obj, "welcome_bonus_assignment_id", None),
+            obj.user,
+            obj.variant.product,
+        )
+        if welcome_bonus:
+            dp = calculate_welcome_bonus_price(dp, welcome_bonus)
+        else:
+            coupon = get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product)
+            if coupon:
+                dp = calculate_coupon_price(dp, coupon)
         return max(dp, 0).quantize(Decimal("0.01"))
 
     def get_discount_amount(
@@ -564,29 +580,65 @@ class CartSerializer(serializers.ModelSerializer):
         obj
     ):
         has_prod = is_offer_valid(obj.variant.product.offer)
-        has_coup = bool(get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product))
-        return has_prod or has_coup
+        has_promotion = bool(
+            get_eligible_welcome_bonus_assignment(
+                getattr(obj, "welcome_bonus_assignment_id", None),
+                obj.user,
+                obj.variant.product,
+            )
+            or get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product)
+        )
+        return has_prod or has_promotion
 
     def get_discount_percentage(
         self,
         obj
     ):
         p_pct = obj.variant.product.offer.discount_percentage if is_offer_valid(obj.variant.product.offer) else 0
-        coupon = get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product)
-        c_pct = coupon.discount_percentage if coupon and coupon.discount_type == "PERCENTAGE" else 0
+        welcome_bonus = get_eligible_welcome_bonus_assignment(
+            getattr(obj, "welcome_bonus_assignment_id", None),
+            obj.user,
+            obj.variant.product,
+        )
+        if welcome_bonus:
+            c_pct = (
+                welcome_bonus.welcome_bonus.discount_percentage
+                if welcome_bonus.welcome_bonus.discount_type == "PERCENTAGE"
+                else 0
+            )
+        else:
+            coupon = get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product)
+            c_pct = coupon.discount_percentage if coupon and coupon.discount_type == "PERCENTAGE" else 0
         return p_pct + c_pct
 
     def get_coupon_code(self, obj):
+        # The user-specific welcome code must never be rendered in cart UI.
+        if getattr(obj, "welcome_bonus_assignment_id", None):
+            return None
         coupon = get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product)
         return coupon.code if coupon else None
 
     def get_coupon_discount_type(self, obj):
+        welcome_bonus = get_eligible_welcome_bonus_assignment(
+            getattr(obj, "welcome_bonus_assignment_id", None),
+            obj.user,
+            obj.variant.product,
+        )
+        if welcome_bonus:
+            return welcome_bonus.welcome_bonus.discount_type
         coupon = get_eligible_coupon(getattr(obj, "coupon_id", None), obj.variant.product)
         return coupon.discount_type if coupon else None
 
     def get_coupon_status(self, obj):
         if getattr(obj, "coupon_status", None):
             return obj.coupon_status
+        if getattr(obj, "welcome_bonus_assignment_id", None):
+            welcome_bonus = get_eligible_welcome_bonus_assignment(
+                obj.welcome_bonus_assignment_id,
+                obj.user,
+                obj.variant.product,
+            )
+            return "WELCOME_BONUS_ACTIVE" if welcome_bonus else "WELCOME_BONUS_INACTIVE"
         if not getattr(obj, "coupon_id", None):
             return None
         return (
@@ -594,6 +646,13 @@ class CartSerializer(serializers.ModelSerializer):
             if get_eligible_coupon(obj.coupon_id, obj.variant.product)
             else "COUPON_INACTIVE"
         )
+
+    def get_promotion_type(self, obj):
+        if getattr(obj, "welcome_bonus_assignment_id", None):
+            return "WELCOME_BONUS"
+        if getattr(obj, "coupon_id", None):
+            return "COUPON"
+        return None
 
     def get_total_price(
         self,
@@ -777,6 +836,23 @@ class OrderItemSerializer(
             return image.image.url
 
         return None
+class WelcomeBonusRedemptionSummarySerializer(serializers.ModelSerializer):
+    welcome_bonus_name = serializers.CharField(source="welcome_bonus.name", read_only=True)
+
+    class Meta:
+        model = WelcomeBonusRedemption
+        fields = (
+            "id",
+            "promotion_type",
+            "welcome_bonus_name",
+            "discount_type",
+            "discount_value",
+            "applied_amount",
+            "redeemed_at",
+        )
+        read_only_fields = fields
+
+
 class OrderSerializer(
     serializers.ModelSerializer
 ):
@@ -830,6 +906,11 @@ class OrderSerializer(
         read_only=True
     )
 
+    welcome_bonus_redemptions = WelcomeBonusRedemptionSummarySerializer(
+        many=True,
+        read_only=True,
+    )
+
     class Meta:
 
         model = Order
@@ -874,7 +955,9 @@ class OrderSerializer(
 
             "cancelled_at",
 
-            "items"
+            "items",
+
+            "welcome_bonus_redemptions",
 
         ]
 class AdminOrderSerializer(
@@ -1467,7 +1550,12 @@ class CouponSerializer(serializers.ModelSerializer):
         )
 
     def validate_code(self, value):
-        return value.strip()
+        value = value.strip()
+        if WelcomeBonusAssignment.objects.filter(code=value).exists():
+            raise serializers.ValidationError(
+                "This code is reserved for a user-specific welcome bonus."
+            )
+        return value
 
     def to_internal_value(self, data):
         # Keep the canonical model field names while accepting the compact
@@ -1603,3 +1691,292 @@ class CouponSerializer(serializers.ModelSerializer):
 
     def get_discount_value(self, obj):
         return obj.fixed_amount if obj.discount_type == Coupon.DISCOUNT_FIXED else obj.discount_percentage
+
+
+class WelcomeBonusSerializer(serializers.ModelSerializer):
+    """Admin-facing campaign serializer. It deliberately has no code field."""
+
+    category_name = serializers.CharField(source="category.name", read_only=True)
+    target_name = serializers.SerializerMethodField(read_only=True)
+    discount_value = serializers.SerializerMethodField(read_only=True)
+    applicability_label = serializers.CharField(
+        source="get_applicability_type_display", read_only=True
+    )
+    discount_type_label = serializers.CharField(
+        source="get_discount_type_display", read_only=True
+    )
+    assigned_user_count = serializers.SerializerMethodField(read_only=True)
+    claimed_user_count = serializers.SerializerMethodField(read_only=True)
+    redeemed_user_count = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = WelcomeBonus
+        fields = (
+            "id",
+            "name",
+            "products",
+            "category",
+            "category_name",
+            "target_name",
+            "applicability_type",
+            "applicability_label",
+            "discount_type",
+            "discount_type_label",
+            "discount_percentage",
+            "fixed_amount",
+            "discount_value",
+            "start_date",
+            "end_date",
+            "is_active",
+            "assigned_user_count",
+            "claimed_user_count",
+            "redeemed_user_count",
+            "created_at",
+            "updated_at",
+        )
+        read_only_fields = (
+            "id",
+            "category_name",
+            "target_name",
+            "applicability_label",
+            "discount_type_label",
+            "discount_value",
+            "assigned_user_count",
+            "claimed_user_count",
+            "redeemed_user_count",
+            "created_at",
+            "updated_at",
+        )
+
+    def to_internal_value(self, data):
+        data = data.copy()
+        if "title" in data and "name" not in data:
+            data["name"] = data["title"]
+        if "apply_to" in data and "applicability_type" not in data:
+            apply_to = str(data["apply_to"]).upper()
+            data["applicability_type"] = {
+                "PRODUCT_WISE": WelcomeBonus.APPLICABILITY_PRODUCT,
+                "CATEGORY_WISE": WelcomeBonus.APPLICABILITY_CATEGORY,
+            }.get(apply_to, apply_to)
+        if "product" in data and "products" not in data:
+            data["products"] = [data["product"]]
+        if "discount_type" in data:
+            discount_type = str(data["discount_type"]).upper()
+            if discount_type in {"FIXED_AMOUNT", "FIXED AMOUNT"}:
+                data["discount_type"] = WelcomeBonus.DISCOUNT_FIXED
+            elif discount_type == "PERCENTAGE_DISCOUNT":
+                data["discount_type"] = WelcomeBonus.DISCOUNT_PERCENTAGE
+        if "discount_value" in data:
+            discount_type = str(
+                data.get(
+                    "discount_type",
+                    getattr(self.instance, "discount_type", WelcomeBonus.DISCOUNT_PERCENTAGE),
+                )
+            ).upper()
+            field = (
+                "fixed_amount"
+                if discount_type in {WelcomeBonus.DISCOUNT_FIXED, "FIXED_AMOUNT", "FIXED AMOUNT"}
+                else "discount_percentage"
+            )
+            data.setdefault(field, data["discount_value"])
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        instance = self.instance
+        applicability = attrs.get(
+            "applicability_type",
+            getattr(instance, "applicability_type", WelcomeBonus.APPLICABILITY_PRODUCT),
+        )
+        category = attrs.get("category", getattr(instance, "category", None))
+        products = attrs.get("products")
+        if products is None and instance is not None:
+            products = list(instance.products.all())
+        products = list(products or [])
+
+        if applicability == WelcomeBonus.APPLICABILITY_CATEGORY:
+            if category is None:
+                raise serializers.ValidationError(
+                    {"category": "A category is required for a category-wise welcome bonus."}
+                )
+            if products:
+                raise serializers.ValidationError(
+                    {"products": "Category-wise welcome bonuses must not contain product targets."}
+                )
+        elif applicability == WelcomeBonus.APPLICABILITY_PRODUCT:
+            if category is not None:
+                raise serializers.ValidationError(
+                    {"category": "Category must be empty for a product-wise welcome bonus."}
+                )
+            if not products:
+                raise serializers.ValidationError(
+                    {"products": "Select at least one product for a product-wise welcome bonus."}
+                )
+        else:
+            raise serializers.ValidationError(
+                {"applicability_type": "Select Product or Category."}
+            )
+
+        discount_type = attrs.get(
+            "discount_type",
+            getattr(instance, "discount_type", WelcomeBonus.DISCOUNT_PERCENTAGE),
+        )
+        percentage = attrs.get(
+            "discount_percentage", getattr(instance, "discount_percentage", None)
+        )
+        fixed_amount = attrs.get("fixed_amount", getattr(instance, "fixed_amount", None))
+        if discount_type == WelcomeBonus.DISCOUNT_PERCENTAGE:
+            if percentage is None or percentage <= 0 or percentage > 100:
+                raise serializers.ValidationError(
+                    {"discount_percentage": "Percentage must be greater than 0 and at most 100."}
+                )
+            attrs["fixed_amount"] = None
+        elif discount_type == WelcomeBonus.DISCOUNT_FIXED:
+            if fixed_amount is None or fixed_amount <= 0:
+                raise serializers.ValidationError(
+                    {"fixed_amount": "Fixed amount must be greater than 0."}
+                )
+            attrs["discount_percentage"] = None
+        else:
+            raise serializers.ValidationError(
+                {"discount_type": "Select Percentage or Fixed Amount."}
+            )
+
+        start_date = attrs.get("start_date", getattr(instance, "start_date", None))
+        end_date = attrs.get("end_date", getattr(instance, "end_date", None))
+        if start_date and end_date and start_date >= end_date:
+            raise serializers.ValidationError(
+                {"end_date": "Expiry date must be after the start date."}
+            )
+        return attrs
+
+    def create(self, validated_data):
+        products = validated_data.pop("products", [])
+        instance = WelcomeBonus(**validated_data)
+        instance.full_clean()
+        instance.save()
+        instance.products.set(products)
+        return instance
+
+    def update(self, instance, validated_data):
+        products = validated_data.pop("products", None)
+        for field, value in validated_data.items():
+            setattr(instance, field, value)
+        instance.full_clean()
+        instance.save()
+        if products is not None:
+            instance.products.set(products)
+        return instance
+
+    def get_target_name(self, obj):
+        if obj.applicability_type == WelcomeBonus.APPLICABILITY_CATEGORY:
+            return obj.category.name if obj.category else None
+        return list(obj.products.values_list("name", flat=True))
+
+    def get_discount_value(self, obj):
+        return obj.fixed_amount if obj.discount_type == WelcomeBonus.DISCOUNT_FIXED else obj.discount_percentage
+
+    def _count(self, obj, annotation, status=None):
+        if hasattr(obj, annotation):
+            return getattr(obj, annotation)
+        assignments = obj.assignments
+        if not status:
+            return assignments.count()
+        if isinstance(status, (tuple, list, set)):
+            return assignments.filter(status__in=status).count()
+        return assignments.filter(status=status).count()
+
+    def get_assigned_user_count(self, obj):
+        return self._count(obj, "assigned_user_count")
+
+    def get_claimed_user_count(self, obj):
+        return self._count(
+            obj,
+            "claimed_user_count",
+            (
+                WelcomeBonusAssignment.STATUS_CLAIMED,
+                WelcomeBonusAssignment.STATUS_REDEEMED,
+            ),
+        )
+
+    def get_redeemed_user_count(self, obj):
+        return self._count(obj, "redeemed_user_count", WelcomeBonusAssignment.STATUS_REDEEMED)
+
+
+class WelcomeBonusNotificationSerializer(serializers.ModelSerializer):
+    """Customer notification payload; the redemption code is never serialized."""
+
+    assignment_id = serializers.IntegerField(source="assignment.id", read_only=True)
+    title = serializers.SerializerMethodField()
+    message = serializers.SerializerMethodField()
+    discount_text = serializers.SerializerMethodField()
+    masked_code = serializers.SerializerMethodField()
+    assignment_status = serializers.SerializerMethodField()
+    can_claim = serializers.SerializerMethodField()
+    can_copy_code = serializers.SerializerMethodField()
+    is_read = serializers.SerializerMethodField()
+
+    class Meta:
+        model = WelcomeBonusNotification
+        fields = (
+            "id",
+            "assignment_id",
+            "title",
+            "message",
+            "discount_text",
+            "masked_code",
+            "assignment_status",
+            "can_claim",
+            "can_copy_code",
+            "is_read",
+            "created_at",
+        )
+        read_only_fields = fields
+
+    def get_title(self, obj):
+        return obj.assignment.welcome_bonus.name
+
+    def get_message(self, obj):
+        return "You have a Welcome Bonus available. Claim it now and use it on eligible products."
+
+    def get_discount_text(self, obj):
+        welcome_bonus = obj.assignment.welcome_bonus
+        if welcome_bonus.discount_type == WelcomeBonus.DISCOUNT_FIXED:
+            return f"Get {welcome_bonus.fixed_amount} OFF on eligible products."
+        return f"Get {welcome_bonus.discount_percentage}% OFF on eligible products."
+
+    def get_masked_code(self, obj):
+        return "••••••••••••••••"
+
+    def _validation_error(self, obj, *, require_claimed=False):
+        return welcome_bonus_validation_error(
+            obj.assignment,
+            obj.assignment.user,
+            require_claimed=require_claimed,
+        )
+
+    def get_assignment_status(self, obj):
+        assignment = obj.assignment
+        if assignment.status == WelcomeBonusAssignment.STATUS_REDEEMED:
+            return WelcomeBonusAssignment.STATUS_REDEEMED
+        error = self._validation_error(obj)
+        if not error:
+            return assignment.status
+        return {
+            "WELCOME_BONUS_INACTIVE": "INACTIVE",
+            "WELCOME_BONUS_EXPIRED": "EXPIRED",
+        }.get(error[0], assignment.status)
+
+    def get_can_claim(self, obj):
+        return bool(
+            obj.assignment.status == WelcomeBonusAssignment.STATUS_AVAILABLE
+            and not self._validation_error(obj)
+        )
+
+    def get_can_copy_code(self, obj):
+        return bool(
+            obj.assignment.status == WelcomeBonusAssignment.STATUS_CLAIMED
+            and not self._validation_error(obj, require_claimed=True)
+        )
+
+    def get_is_read(self, obj):
+        return obj.read_at is not None

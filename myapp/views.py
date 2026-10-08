@@ -62,6 +62,12 @@ import csv
 import logging
 from google.auth.exceptions import GoogleAuthError
 from .utils import AuthRateThrottle, SearchRateThrottle
+from .welcome_bonus import (
+    calculate_welcome_bonus_price,
+    get_eligible_welcome_bonus_assignment,
+    redeem_welcome_bonus_assignment,
+    welcome_bonus_validation_error,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1062,6 +1068,54 @@ def _refresh_cart_coupon(cart_item):
     return None
 
 
+def _refresh_cart_welcome_bonus(cart_item):
+    """Reload a cart welcome-bonus entitlement and detach stale discounts."""
+    if not cart_item.welcome_bonus_assignment_id:
+        return None
+
+    assignment_id = cart_item.welcome_bonus_assignment_id
+    assignment = get_eligible_welcome_bonus_assignment(
+        assignment_id,
+        cart_item.user,
+        cart_item.variant.product,
+    )
+    if assignment:
+        cart_item.welcome_bonus_assignment = assignment
+        return assignment
+
+    Cart.objects.filter(
+        pk=cart_item.pk,
+        welcome_bonus_assignment_id=assignment_id,
+    ).update(welcome_bonus_assignment=None)
+    SavedWelcomeBonus.objects.filter(
+        user=cart_item.user,
+        product=cart_item.variant.product,
+        assignment_id=assignment_id,
+    ).delete()
+    cart_item.welcome_bonus_assignment = None
+    cart_item.coupon_status = "WELCOME_BONUS_INACTIVE"
+    return None
+
+
+def _refresh_cart_promotion(cart_item):
+    """Return ``(source, object)`` after current server-side validation."""
+    welcome_bonus = _refresh_cart_welcome_bonus(cart_item)
+    if welcome_bonus:
+        return "WELCOME_BONUS", welcome_bonus
+    coupon = _refresh_cart_coupon(cart_item)
+    if coupon:
+        return "COUPON", coupon
+    return None, None
+
+
+def _apply_cart_promotion_price(price, source, promotion):
+    if source == "WELCOME_BONUS":
+        return calculate_welcome_bonus_price(price, promotion)
+    if source == "COUPON":
+        return calculate_coupon_price(price, promotion)
+    return Decimal(str(price or 0)).quantize(Decimal("0.01"))
+
+
 class CartAddError(Exception):
     """A controlled validation error for the existing cart endpoint."""
 
@@ -1169,6 +1223,25 @@ def _eligible_cart_coupon(user, product):
     return coupon
 
 
+def _eligible_cart_welcome_bonus(user, product):
+    """Find the user's claimed, saved bonus for this product/category."""
+    saved_bonuses = SavedWelcomeBonus.objects.filter(user=user).select_related(
+        "assignment__welcome_bonus"
+    ).prefetch_related("assignment__welcome_bonus__products")
+    for saved_bonus in saved_bonuses:
+        assignment = get_eligible_welcome_bonus_assignment(
+            saved_bonus.assignment_id,
+            user,
+            product,
+        )
+        if assignment:
+            return assignment
+        # The saved product is no longer useful if its campaign cannot be used
+        # at all. Do not delete the claim or redemption audit record.
+        SavedWelcomeBonus.objects.filter(pk=saved_bonus.pk).delete()
+    return None
+
+
 def _add_cart_line(user, variant_id, variant_unit_id, quantity, *, require_variant_unit=False):
     """Add one validated SKU through the original Cart model and coupon flow."""
     variant, variant_unit, available_stock = _resolve_cart_variant(
@@ -1177,26 +1250,32 @@ def _add_cart_line(user, variant_id, variant_unit_id, quantity, *, require_varia
         quantity,
         require_variant_unit=require_variant_unit,
     )
-    coupon = _eligible_cart_coupon(user, variant.product)
+    welcome_bonus = _eligible_cart_welcome_bonus(user, variant.product)
+    coupon = None if welcome_bonus else _eligible_cart_coupon(user, variant.product)
     cart_item, created = Cart.objects.get_or_create(
         user=user,
         variant=variant,
         variant_unit=variant_unit,
-        defaults={"quantity": quantity, "coupon": coupon},
+        defaults={
+            "quantity": quantity,
+            "coupon": coupon,
+            "welcome_bonus_assignment": welcome_bonus,
+        },
     )
     if not created:
         new_quantity = cart_item.quantity + quantity
         if new_quantity > available_stock:
             raise CartAddError(f"Only {available_stock} items available in stock")
-        existing_coupon = _refresh_cart_coupon(cart_item)
-        if coupon is None and existing_coupon:
-            coupon = existing_coupon
+        source, existing_promotion = _refresh_cart_promotion(cart_item)
+        if welcome_bonus is None and coupon is None and existing_promotion:
+            if source == "WELCOME_BONUS":
+                welcome_bonus = existing_promotion
+            else:
+                coupon = existing_promotion
         cart_item.quantity = new_quantity
-        if coupon:
-            cart_item.coupon = coupon
-        elif cart_item.coupon_id:
-            cart_item.coupon = None
-        cart_item.save()
+        cart_item.coupon = coupon
+        cart_item.welcome_bonus_assignment = welcome_bonus
+        cart_item.save(update_fields=("quantity", "coupon", "welcome_bonus_assignment"))
     return cart_item
 
 
@@ -1403,10 +1482,6 @@ def add_to_cart(request):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_cart(request):
-
-    print("USER =", request.user)
-    print("AUTH =", request.auth)
-
     cart = (
         Cart.objects
         .filter(user=request.user)
@@ -1424,10 +1499,10 @@ def get_cart(request):
     )
 
     cart_items = list(cart)
-    current_coupons = {
-        item.id: _refresh_cart_coupon(item)
+    current_promotions = {
+        item.id: _refresh_cart_promotion(item)
         for item in cart_items
-        if item.coupon_id
+        if item.coupon_id or item.welcome_bonus_assignment_id
     }
 
     serializer = CartSerializer(
@@ -1446,9 +1521,13 @@ def get_cart(request):
             price,
             item.variant.product.offer
         )
-        coupon = current_coupons.get(item.id)
-        if coupon:
-            discounted_price = calculate_coupon_price(discounted_price, coupon)
+        source, promotion = current_promotions.get(item.id, (None, None))
+        if promotion:
+            discounted_price = _apply_cart_promotion_price(
+                discounted_price,
+                source,
+                promotion,
+            )
 
         subtotal += (
             discounted_price *
@@ -1494,7 +1573,7 @@ def update_cart_quantity(request, id):
             status=status.HTTP_404_NOT_FOUND
         )
 
-    current_coupon = _refresh_cart_coupon(cart)
+    current_source, current_promotion = _refresh_cart_promotion(cart)
 
     try:
 
@@ -1549,8 +1628,12 @@ def update_cart_quantity(request, id):
         original_price or 0,
         cart.variant.product.offer
     )
-    if current_coupon:
-        discounted_price = calculate_coupon_price(discounted_price, current_coupon)
+    if current_promotion:
+        discounted_price = _apply_cart_promotion_price(
+            discounted_price,
+            current_source,
+            current_promotion,
+        )
 
     line_total = (
         discounted_price *
@@ -1572,7 +1655,7 @@ def update_cart_quantity(request, id):
 
     for item in cart_items:
 
-        item_coupon = _refresh_cart_coupon(item)
+        item_source, item_promotion = _refresh_cart_promotion(item)
 
         item_price = (
             item.variant.price
@@ -1583,8 +1666,12 @@ def update_cart_quantity(request, id):
             item_price or 0,
             item.variant.product.offer,
         )
-        if item_coupon:
-            item_discounted_price = calculate_coupon_price(item_discounted_price, item_coupon)
+        if item_promotion:
+            item_discounted_price = _apply_cart_promotion_price(
+                item_discounted_price,
+                item_source,
+                item_promotion,
+            )
         subtotal += item_discounted_price * item.quantity
 
         total_items += item.quantity
@@ -1650,7 +1737,7 @@ def place_order(request):
             status=status.HTTP_404_NOT_FOUND
         )
 
-    cart_items = (
+    cart_items = list(
         Cart.objects
         .select_for_update()
         .select_related(
@@ -1664,7 +1751,7 @@ def place_order(request):
         .order_by("id")
     )
 
-    if not cart_items.exists():
+    if not cart_items:
 
         return Response(
             {
@@ -1679,6 +1766,29 @@ def place_order(request):
     discount_total = Decimal("0.00")
 
     discounted_subtotal = Decimal("0.00")
+
+    # A claimed code can be attached to more than one eligible category line,
+    # but it can only be redeemed by one successful order. Lock it before any
+    # pricing is calculated so concurrent checkouts cannot consume it twice.
+    assignment_ids = {
+        item.welcome_bonus_assignment_id
+        for item in cart_items
+        if item.welcome_bonus_assignment_id
+    }
+    locked_assignments = {
+        assignment.id: assignment
+        for assignment in WelcomeBonusAssignment.objects.select_for_update()
+        .select_related("welcome_bonus", "user")
+        .prefetch_related("welcome_bonus__products")
+        .filter(id__in=assignment_ids)
+    }
+    for item in cart_items:
+        if item.welcome_bonus_assignment_id:
+            item.welcome_bonus_assignment = locked_assignments.get(
+                item.welcome_bonus_assignment_id
+            )
+
+    welcome_bonus_amounts = {}
 
     for item in cart_items:
 
@@ -1711,9 +1821,19 @@ def place_order(request):
             original_price,
             item.variant.product.offer
         )
-        current_coupon = _refresh_cart_coupon(item)
-        if current_coupon:
-            discounted_price = calculate_coupon_price(discounted_price, current_coupon)
+        promotion_source, current_promotion = _refresh_cart_promotion(item)
+        if current_promotion:
+            before_promotion = discounted_price
+            discounted_price = _apply_cart_promotion_price(
+                discounted_price,
+                promotion_source,
+                current_promotion,
+            )
+            if promotion_source == "WELCOME_BONUS":
+                welcome_bonus_amounts[current_promotion.id] = (
+                    welcome_bonus_amounts.get(current_promotion.id, Decimal("0.00"))
+                    + (before_promotion - discounted_price) * item.quantity
+                )
 
         discount_amount = original_price - discounted_price
 
@@ -1763,16 +1883,21 @@ def place_order(request):
             original_price,
             item.variant.product.offer
         )
-        current_coupon = _refresh_cart_coupon(item)
-        if current_coupon:
-            discounted_price = calculate_coupon_price(discounted_price, current_coupon)
-            
+        promotion_source, current_promotion = _refresh_cart_promotion(item)
+        if current_promotion:
+            discounted_price = _apply_cart_promotion_price(
+                discounted_price,
+                promotion_source,
+                current_promotion,
+            )
+
+        if promotion_source == "COUPON" and current_promotion:
             CouponUsage.objects.get_or_create(
-                coupon=current_coupon,
+                coupon=current_promotion,
                 user=request.user,
                 product=item.variant.product
             )
-            SavedCoupon.objects.filter(user=request.user, coupon=current_coupon, product=item.variant.product).delete()
+            SavedCoupon.objects.filter(user=request.user, coupon=current_promotion, product=item.variant.product).delete()
 
         discount_amount = original_price - discounted_price
 
@@ -1809,7 +1934,12 @@ def place_order(request):
             item.variant.stock -= item.quantity
             item.variant.save()
 
-    cart_items.delete()
+    for assignment_id, applied_amount in welcome_bonus_amounts.items():
+        assignment = locked_assignments.get(assignment_id)
+        if assignment:
+            redeem_welcome_bonus_assignment(assignment, order, applied_amount)
+
+    Cart.objects.filter(pk__in=[item.pk for item in cart_items]).delete()
 
     transaction.on_commit(
         lambda order_id=order.id: send_owner_order_notification(order_id)
@@ -3140,6 +3270,7 @@ def get_hero_side_banner(request):
     return Response({})
 
 from rest_framework import viewsets, filters
+from rest_framework.decorators import action
 from django.utils import timezone
 
 class CouponViewSet(viewsets.ModelViewSet):
@@ -3150,6 +3281,197 @@ class CouponViewSet(viewsets.ModelViewSet):
     permission_classes = [IsSuperAdmin]
     filter_backends = [filters.SearchFilter]
     search_fields = ['code', 'products__name', 'category__name']
+
+
+class WelcomeBonusViewSet(viewsets.ModelViewSet):
+    """Separate Super Admin API for the Welcome Bonuses dashboard section."""
+
+    serializer_class = WelcomeBonusSerializer
+    permission_classes = [IsSuperAdmin]
+    filter_backends = [filters.SearchFilter]
+    search_fields = ("name", "products__name", "category__name")
+    ordering_fields = (
+        "name",
+        "applicability_type",
+        "discount_type",
+        "start_date",
+        "end_date",
+        "is_active",
+        "created_at",
+    )
+
+    def get_queryset(self):
+        queryset = (
+            WelcomeBonus.objects.select_related("category")
+            .prefetch_related("products")
+            .annotate(
+                assigned_user_count=Count("assignments", distinct=True),
+                claimed_user_count=Count(
+                    "assignments",
+                    filter=Q(
+                        assignments__status__in=(
+                            WelcomeBonusAssignment.STATUS_CLAIMED,
+                            WelcomeBonusAssignment.STATUS_REDEEMED,
+                        )
+                    ),
+                    distinct=True,
+                ),
+                redeemed_user_count=Count(
+                    "assignments",
+                    filter=Q(assignments__status=WelcomeBonusAssignment.STATUS_REDEEMED),
+                    distinct=True,
+                ),
+            )
+            .order_by("-created_at", "-id")
+        )
+        if self.request.query_params.get("include_archived") not in {"1", "true"}:
+            queryset = queryset.filter(archived_at__isnull=True)
+        is_active = self.request.query_params.get("is_active")
+        if is_active in {"true", "false", "1", "0"}:
+            queryset = queryset.filter(is_active=is_active in {"true", "1"})
+        return queryset
+
+    def perform_destroy(self, instance):
+        # Keep all historical code/order records intact. Archived bonuses are
+        # immediately ineligible because every validation re-reads this row.
+        instance.is_active = False
+        instance.archived_at = timezone.now()
+        instance.save(update_fields=("is_active", "archived_at", "updated_at"))
+
+    @action(detail=True, methods=["post"], url_path="toggle-active")
+    def toggle_active(self, request, pk=None):
+        welcome_bonus = self.get_object()
+        if welcome_bonus.archived_at is not None:
+            return Response(
+                {"message": "Archived welcome bonuses cannot be reactivated."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        welcome_bonus.is_active = not welcome_bonus.is_active
+        welcome_bonus.save(update_fields=("is_active", "updated_at"))
+        return Response(self.get_serializer(welcome_bonus).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def welcome_bonus_notifications(request):
+    now = timezone.now()
+    notifications = (
+        WelcomeBonusNotification.objects.filter(
+            assignment__user=request.user,
+            assignment__welcome_bonus__is_active=True,
+            assignment__welcome_bonus__archived_at__isnull=True,
+            assignment__welcome_bonus__start_date__lte=now,
+            assignment__welcome_bonus__end_date__gte=now,
+        )
+        .select_related("assignment__welcome_bonus", "assignment__user")
+        .prefetch_related("assignment__welcome_bonus__products")
+    )
+    unread_count = notifications.filter(read_at__isnull=True).count()
+    return Response(
+        {
+            "unread_count": unread_count,
+            "notifications": WelcomeBonusNotificationSerializer(
+                notifications, many=True
+            ).data,
+        }
+    )
+
+
+def _get_user_welcome_bonus_notification(request, notification_id):
+    try:
+        return (
+            WelcomeBonusNotification.objects.select_for_update()
+            .select_related("assignment__welcome_bonus", "assignment__user")
+            .prefetch_related("assignment__welcome_bonus__products")
+            .get(pk=notification_id, assignment__user=request.user)
+        )
+    except WelcomeBonusNotification.DoesNotExist:
+        return None
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
+def claim_welcome_bonus(request, notification_id):
+    notification = _get_user_welcome_bonus_notification(request, notification_id)
+    if not notification:
+        return Response({"message": "Welcome bonus notification not found."}, status=404)
+
+    assignment = notification.assignment
+    validation_error = welcome_bonus_validation_error(
+        assignment,
+        request.user,
+        require_claimed=False,
+    )
+    if validation_error:
+        return Response(
+            {"message": validation_error[1], "error_code": validation_error[0]},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if assignment.status == WelcomeBonusAssignment.STATUS_REDEEMED:
+        return Response(
+            {
+                "message": "This welcome bonus has already been redeemed.",
+                "error_code": "WELCOME_BONUS_ALREADY_REDEEMED",
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if assignment.status == WelcomeBonusAssignment.STATUS_AVAILABLE:
+        assignment.status = WelcomeBonusAssignment.STATUS_CLAIMED
+        assignment.claimed_at = timezone.now()
+        assignment.save(update_fields=("status", "claimed_at", "updated_at"))
+    if notification.read_at is None:
+        notification.read_at = timezone.now()
+        notification.save(update_fields=("read_at",))
+
+    # Intentionally no ``code`` in the response. The clipboard-only endpoint
+    # exposes it just-in-time after this claimed state has been persisted.
+    return Response(
+        {
+            "message": "Welcome bonus claimed successfully.",
+            "notification": WelcomeBonusNotificationSerializer(notification).data,
+        }
+    )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
+def mark_welcome_bonus_notification_read(request, notification_id):
+    notification = _get_user_welcome_bonus_notification(request, notification_id)
+    if not notification:
+        return Response({"message": "Welcome bonus notification not found."}, status=404)
+    if notification.read_at is None:
+        notification.read_at = timezone.now()
+        notification.save(update_fields=("read_at",))
+    return Response({"message": "Notification marked as read."})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
+def copy_welcome_bonus_code(request, notification_id):
+    """Return the code only for a claimed owner, with no-store protection.
+
+    A browser must receive a value to write it to the clipboard. This is the
+    narrowest endpoint that does so; list/claim/cart/order responses never
+    serialize the code.
+    """
+    notification = _get_user_welcome_bonus_notification(request, notification_id)
+    if not notification:
+        return Response({"message": "Welcome bonus notification not found."}, status=404)
+    assignment = notification.assignment
+    validation_error = welcome_bonus_validation_error(assignment, request.user)
+    if validation_error:
+        return Response(
+            {"message": validation_error[1], "error_code": validation_error[0]},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    response = Response({"code": assignment.code})
+    response["Cache-Control"] = "no-store, private"
+    response["Pragma"] = "no-cache"
+    return response
 
 @api_view(['POST'])
 @permission_classes([IsAuthenticated])
@@ -3170,6 +3492,83 @@ def validate_coupon(request):
         product = Product.objects.get(id=product_id, is_active=True)
     except Product.DoesNotExist:
         return Response({'message': 'Product not found'}, status=status.HTTP_404_NOT_FOUND)
+
+    # Resolve by the persisted redemption-code relationship, not by a string
+    # prefix. A normal Coupon is only considered when no private assignment
+    # owns the submitted code.
+    welcome_bonus_assignment = (
+        WelcomeBonusAssignment.objects.select_for_update()
+        .select_related("welcome_bonus", "user")
+        .prefetch_related("welcome_bonus__products")
+        .filter(code=code)
+        .first()
+    )
+    if welcome_bonus_assignment:
+        validation_error = welcome_bonus_validation_error(
+            welcome_bonus_assignment,
+            request.user,
+            product,
+        )
+        if validation_error:
+            error_code, message = validation_error
+            return Response(
+                {
+                    "message": message,
+                    "error_code": error_code,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # A claim is not a redemption. Applying a code merely records the
+        # intended product and attaches it to eligible cart rows; it is only
+        # consumed after a successful order is created.
+        WelcomeBonusApplication.objects.get_or_create(
+            assignment=welcome_bonus_assignment,
+            product=product,
+        )
+        SavedWelcomeBonus.objects.update_or_create(
+            user=request.user,
+            product=product,
+            defaults={"assignment": welcome_bonus_assignment},
+        )
+        SavedCoupon.objects.filter(user=request.user, product=product).delete()
+
+        Cart.objects.filter(
+            user=request.user,
+            variant__product=product,
+        ).update(
+            coupon=None,
+            welcome_bonus_assignment=welcome_bonus_assignment,
+        )
+
+        welcome_bonus = welcome_bonus_assignment.welcome_bonus
+        if welcome_bonus.applicability_type == WelcomeBonus.APPLICABILITY_CATEGORY:
+            # Apply to other eligible cart lines without replacing a different
+            # explicit promotion. Future category items are covered by the
+            # saved assignment lookup in ``_eligible_cart_welcome_bonus``.
+            Cart.objects.filter(
+                user=request.user,
+                variant__product__category_id=product.category_id,
+            ).filter(
+                Q(coupon__isnull=True)
+                | Q(welcome_bonus_assignment=welcome_bonus_assignment)
+            ).update(
+                coupon=None,
+                welcome_bonus_assignment=welcome_bonus_assignment,
+            )
+
+        return Response(
+            {
+                "message": "Welcome bonus applied successfully",
+                "promotion_type": "WELCOME_BONUS",
+                "welcome_bonus_id": welcome_bonus.id,
+                "discount_percentage": welcome_bonus.discount_percentage,
+                "fixed_amount": welcome_bonus.fixed_amount,
+                "discount_type": welcome_bonus.discount_type,
+                "applicability_type": welcome_bonus.applicability_type,
+            },
+            status=status.HTTP_200_OK,
+        )
 
     try:
         # Lock and reload the authoritative row so an admin status change
@@ -3257,7 +3656,8 @@ def validate_coupon(request):
     Cart.objects.filter(
         user=request.user,
         variant__product=product
-    ).update(coupon=coupon)
+    ).update(coupon=coupon, welcome_bonus_assignment=None)
+    SavedWelcomeBonus.objects.filter(user=request.user, product=product).delete()
 
     if coupon.applicability_type == Coupon.APPLICABILITY_CATEGORY:
         # Apply the category coupon to other currently-carted eligible lines
@@ -3266,7 +3666,13 @@ def validate_coupon(request):
             user=request.user,
             variant__product__category_id=product.category_id,
             coupon__isnull=True,
+            welcome_bonus_assignment__isnull=True,
         ).update(coupon=coupon)
+        SavedWelcomeBonus.objects.filter(
+            user=request.user,
+            assignment__welcome_bonus__applicability_type=WelcomeBonus.APPLICABILITY_CATEGORY,
+            assignment__welcome_bonus__category_id=product.category_id,
+        ).delete()
         
     return Response({
         'message': 'Coupon applied successfully',

@@ -49,7 +49,7 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
 
-    "myapp",
+    "myapp.apps.MyappConfig",
     "payment",
 
     "rest_framework",

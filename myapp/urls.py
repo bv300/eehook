@@ -105,6 +105,26 @@ path(
         views.validate_coupon, 
         name="validate-coupon"
     ),
+    path(
+        "welcome-bonus-notifications/",
+        views.welcome_bonus_notifications,
+        name="welcome-bonus-notifications",
+    ),
+    path(
+        "welcome-bonus-notifications/<int:notification_id>/claim/",
+        views.claim_welcome_bonus,
+        name="claim-welcome-bonus",
+    ),
+    path(
+        "welcome-bonus-notifications/<int:notification_id>/read/",
+        views.mark_welcome_bonus_notification_read,
+        name="read-welcome-bonus-notification",
+    ),
+    path(
+        "welcome-bonus-notifications/<int:notification_id>/copy-code/",
+        views.copy_welcome_bonus_code,
+        name="copy-welcome-bonus-code",
+    ),
 ]
 
 from rest_framework.routers import DefaultRouter
@@ -140,6 +160,7 @@ from .super_admin_api import (
 )
 router = DefaultRouter()
 router.register(r'admin-coupons', views.CouponViewSet, basename='admin-coupon')
+router.register(r'admin-welcome-bonuses', views.WelcomeBonusViewSet, basename='admin-welcome-bonus')
 router.register(r'admin/manage/users', AdminUserViewSet, basename='admin-manage-user')
 router.register(r'admin/manage/brands', AdminBrandViewSet, basename='admin-manage-brand')
 router.register(r'admin/manage/categories', AdminCategoryViewSet, basename='admin-manage-category')
@@ -164,6 +185,7 @@ router.register(r'admin/manage/trust-benefits', AdminTrustBenefitViewSet, basena
 router.register(r'admin/manage/promo-banners', AdminPromoBannerViewSet, basename='admin-manage-promo-banner')
 router.register(r'admin/manage/hero-side-banners', AdminHeroSideBannerViewSet, basename='admin-manage-hero-side-banner')
 router.register(r'admin/manage/coupons', AdminCouponViewSet, basename='admin-manage-coupon')
+router.register(r'admin/manage/welcome-bonuses', views.WelcomeBonusViewSet, basename='admin-manage-welcome-bonus')
 router.register(r'admin/manage/coupon-usages', AdminCouponUsageViewSet, basename='admin-manage-coupon-usage')
 
 urlpatterns += router.urls
