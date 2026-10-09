@@ -1,5 +1,6 @@
 import nested_admin
 from django.contrib import admin
+from types import MethodType
 from django import forms
 from django.contrib.admin.widgets import FilteredSelectMultiple
 from django.db import transaction
@@ -8,6 +9,21 @@ from .models import *
 admin.site.site_header = "Order Dashboard"
 admin.site.site_title = "Order Dashboard"
 admin.site.index_title = "Order Dashboard"
+
+
+def _super_admin_site_permission(_site, request):
+    """Django admin must use the same role boundary as API admin endpoints."""
+    user = request.user
+    return bool(
+        user
+        and user.is_authenticated
+        and user.is_active
+        and user.is_staff
+        and user.role == "Super Admin"
+    )
+
+
+admin.site.has_permission = MethodType(_super_admin_site_permission, admin.site)
 
 @admin.register(User)
 class UserAdmin(admin.ModelAdmin):

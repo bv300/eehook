@@ -3,14 +3,16 @@ from decimal import Decimal
 import stripe
 
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.http import HttpResponse
 from django.views.decorators.csrf import csrf_exempt
+from urllib.parse import urlparse
 import logging
 
 from rest_framework.decorators import (
     api_view,
     permission_classes,
+    throttle_classes,
 )
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -19,6 +21,7 @@ from rest_framework import status
 from myapp.models import (
     Cart,
     Address,
+    AdminAuditLog,
     Order,
     OrderItem,
     ProductVariant,
@@ -34,6 +37,7 @@ from myapp.utils import (
     calculate_order_total,
     calculate_coupon_price,
     get_eligible_coupon,
+    PaymentRateThrottle,
 )
 from myapp.welcome_bonus import (
     calculate_welcome_bonus_price,
@@ -55,6 +59,7 @@ stripe.api_key = settings.STRIPE_SECRET_KEY
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
+@throttle_classes([PaymentRateThrottle])
 @transaction.atomic
 def create_checkout_session(request):
 
@@ -69,20 +74,13 @@ def create_checkout_session(request):
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    try:
-
-        address = Address.objects.get(
-            id=address_id,
-            user=request.user
-        )
-
-    except Address.DoesNotExist:
-
+    address = Address.objects.filter(id=address_id).first()
+    if not address:
+        return Response({"message": "Address not found"}, status=status.HTTP_404_NOT_FOUND)
+    if address.user_id != request.user.id:
         return Response(
-            {
-                "message": "Invalid address"
-            },
-            status=status.HTTP_400_BAD_REQUEST
+            {"detail": "You do not have permission to use this address."},
+            status=status.HTTP_403_FORBIDDEN,
         )
 
 
@@ -214,7 +212,7 @@ def create_checkout_session(request):
         line_items.append(
             {
                 "price_data": {
-                    "currency": "nzd",
+                    "currency": "aed",
 
                     "product_data": {
                         "name": item.variant.product.name,
@@ -262,7 +260,7 @@ def create_checkout_session(request):
         line_items.append(
             {
                 "price_data": {
-                    "currency": "nzd",
+                    "currency": "aed",
 
                     "product_data": {
                         "name": "Shipping",
@@ -298,13 +296,11 @@ def create_checkout_session(request):
             line_items=line_items,
 
             success_url=(
-                "https://www.amora.nz/payment-success"
+                f"{settings.SITE_URL}/payment-success"
                 "?session_id={CHECKOUT_SESSION_ID}"
             ),
 
-            cancel_url=(
-                "https://www.amora.nz/checkout"
-            ),
+            cancel_url=f"{settings.SITE_URL}/checkout",
 
             metadata={
                 "user_id": str(request.user.id),
@@ -327,16 +323,99 @@ def create_checkout_session(request):
         )
 
 
-    return Response(
-        {
-            "checkout_url": session.url
-        }
-    )
+    checkout_url = getattr(session, "url", "")
+    parsed_url = urlparse(checkout_url)
+    if parsed_url.scheme != "https" or parsed_url.hostname != "checkout.stripe.com":
+        logger.critical("Stripe returned an unexpected Checkout URL", extra={"user_id": request.user.id})
+        return Response(
+            {"message": "Unable to start secure payment. Please try again later."},
+            status=status.HTTP_502_BAD_GATEWAY,
+        )
+
+    return Response({"checkout_url": checkout_url})
 
 
 # =========================================================
 # FULFILL PAID ORDER
 # =========================================================
+
+
+class CheckoutFulfillmentError(ValueError):
+    """A paid checkout cannot be fulfilled and must be refunded."""
+
+
+def refund_unfulfillable_checkout(session, error):
+    """Refund a paid, unfulfillable checkout exactly once and retain an audit record.
+
+    A webhook must never endlessly retry after a stock/coupon race while the
+    customer has already been charged. Stripe's idempotency key makes retrying
+    this method safe if our database transaction is interrupted.
+    """
+    existing_order = Order.objects.filter(stripe_session_id=session.id).first()
+    if existing_order:
+        return existing_order
+
+    payment_intent = getattr(session, "payment_intent", None)
+    if not payment_intent:
+        raise RuntimeError("A paid Stripe session is missing its payment intent.")
+
+    stripe.Refund.create(
+        payment_intent=str(payment_intent),
+        idempotency_key=f"checkout-fulfillment-refund:{session.id}",
+    )
+
+    metadata = session.metadata or {}
+    try:
+        user_id = int(metadata["user_id"])
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.critical(
+            "Refunded Stripe checkout %s could not be recorded: invalid user metadata",
+            session.id,
+        )
+        raise RuntimeError("Refunded checkout has invalid user metadata.") from exc
+
+    address_id = metadata.get("address_id")
+    address = Address.objects.filter(id=address_id, user_id=user_id).first()
+    total = Decimal(str(session.amount_total or 0)) / Decimal("100")
+
+    try:
+        with transaction.atomic():
+            order = Order.objects.create(
+                user_id=user_id,
+                address=address,
+                subtotal=total,
+                discount_amount=Decimal("0.00"),
+                shipping_charge=Decimal("0.00"),
+                total_amount=total,
+                payment_status="Refunded",
+                status="Cancelled",
+                stripe_session_id=session.id,
+            )
+            AdminAuditLog.objects.create(
+                action="stripe_refund",
+                entity_type="order",
+                entity_id=str(order.id),
+                description=(
+                    "Automatic Stripe refund after checkout fulfillment failure: "
+                    f"{error}"
+                ),
+            )
+    except IntegrityError:
+        order = Order.objects.get(stripe_session_id=session.id)
+
+    logger.warning(
+        "Automatically refunded Stripe checkout %s because fulfillment failed: %s",
+        session.id,
+        error,
+    )
+    return order
+
+
+def fulfill_or_refund_paid_order(session):
+    try:
+        return fulfill_paid_order(session)
+    except CheckoutFulfillmentError as error:
+        return refund_unfulfillable_checkout(session, error)
 
 @transaction.atomic
 def fulfill_paid_order(session):
@@ -412,7 +491,7 @@ def fulfill_paid_order(session):
         )
 
 
-    if session.currency.lower() != "nzd":
+    if session.currency.lower() != "aed":
 
         raise ValueError(
             "Invalid payment currency"
@@ -575,7 +654,7 @@ def fulfill_paid_order(session):
 
     except Address.DoesNotExist:
 
-        raise ValueError(
+        raise CheckoutFulfillmentError(
             "Address not found"
         )
 
@@ -651,7 +730,7 @@ def fulfill_paid_order(session):
 
         if not variant_unit and not variant:
 
-            raise ValueError(
+            raise CheckoutFulfillmentError(
                 "Product variant not found"
             )
 
@@ -659,7 +738,7 @@ def fulfill_paid_order(session):
         product_name = variant_unit.variant.product.name if variant_unit else variant.product.name
         if stock < snapshot["quantity"]:
 
-            raise ValueError(
+            raise CheckoutFulfillmentError(
                 f"Insufficient stock for "
                 f"{product_name}"
             )
@@ -674,7 +753,7 @@ def fulfill_paid_order(session):
         variant = locked_variants.get(snapshot["variant_id"])
         selected_variant = variant_unit.variant if variant_unit else variant
         if not get_eligible_coupon(snapshot["coupon_id"], selected_variant.product):
-            raise ValueError("Coupon is no longer active. Please retry checkout.")
+            raise CheckoutFulfillmentError("Coupon is no longer active.")
 
     # Revalidate the private entitlement, ownership, campaign state and the
     # calculated server-side price immediately before creating the order. A
@@ -686,7 +765,7 @@ def fulfill_paid_order(session):
             continue
         assignment = locked_welcome_bonus_assignments.get(assignment_id)
         if not assignment or assignment.user_id != user_id:
-            raise ValueError("Welcome bonus is no longer available. Please retry checkout.")
+            raise CheckoutFulfillmentError("Welcome bonus is no longer available.")
         variant_unit = locked_sizes.get(snapshot["variant_unit_id"])
         variant = locked_variants.get(snapshot["variant_id"])
         selected_variant = variant_unit.variant if variant_unit else variant
@@ -696,7 +775,7 @@ def fulfill_paid_order(session):
             selected_variant.product,
         )
         if not assignment:
-            raise ValueError("Welcome bonus is no longer active. Please retry checkout.")
+            raise CheckoutFulfillmentError("Welcome bonus is no longer active.")
         current_original_price = (
             variant_unit.price if variant_unit else selected_variant.price
         )
@@ -712,7 +791,7 @@ def fulfill_paid_order(session):
             current_discounted_price != snapshot["price"]
             or current_original_price != snapshot["original_price"]
         ):
-            raise ValueError("Welcome bonus price changed. Please retry checkout.")
+            raise CheckoutFulfillmentError("Welcome bonus price changed.")
         welcome_bonus_amounts[assignment.id] = (
             welcome_bonus_amounts.get(assignment.id, Decimal("0.00"))
             + (current_offer_price - current_discounted_price) * snapshot["quantity"]
@@ -909,9 +988,7 @@ def payment_success(request):
 
         # The webhook may already have created the order.
         # If not, this safely creates it after verifying payment.
-        order = fulfill_paid_order(
-            session
-        )
+        order = fulfill_or_refund_paid_order(session)
 
     except ValueError as error:
 
@@ -934,6 +1011,16 @@ def payment_success(request):
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
+
+    if order.payment_status == "Refunded":
+        return Response(
+            {
+                "message": "Payment was refunded because the order could not be fulfilled.",
+                "order_id": order.id,
+                "payment_status": order.payment_status,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
 
     return Response(
         {
@@ -1018,9 +1105,7 @@ def stripe_webhook(request):
 
             try:
 
-                fulfill_paid_order(
-                    session
-                )
+                fulfill_or_refund_paid_order(session)
 
             except Exception:
 
@@ -1047,9 +1132,7 @@ def stripe_webhook(request):
 
         try:
 
-            fulfill_paid_order(
-                session
-            )
+            fulfill_or_refund_paid_order(session)
 
         except Exception:
 

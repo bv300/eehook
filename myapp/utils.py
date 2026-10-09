@@ -247,6 +247,15 @@ class AuthRateThrottle(SimpleRateThrottle):
         }
 
 
+class PaymentRateThrottle(SimpleRateThrottle):
+    scope = "payment"
+
+    def get_cache_key(self, request, view):
+        user = getattr(request, "user", None)
+        ident = str(user.pk) if user and user.is_authenticated else self.get_ident(request)
+        return self.cache_format % {"scope": self.scope, "ident": ident}
+
+
 class SearchRateThrottle(SimpleRateThrottle):
     scope = "search"
 

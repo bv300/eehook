@@ -649,7 +649,8 @@ class Order(models.Model):
     stripe_session_id = models.CharField(
         max_length=255,
         blank=True,
-        null=True
+        null=True,
+        unique=True,
     )
 
     status = models.CharField(

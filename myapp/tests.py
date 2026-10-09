@@ -1,4 +1,5 @@
 from django.test import TestCase
+from django.conf import settings
 
 # Create your tests here.
 
@@ -13,11 +14,17 @@ from datetime import timedelta
 from io import BytesIO
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core import mail
+from django.contrib.auth.tokens import default_token_generator
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
 from PIL import Image
+from rest_framework_simplejwt.token_blacklist.models import BlacklistedToken, OutstandingToken
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from .admin import ProductAdminForm, ProductVariantForm
 from .models import (
@@ -194,6 +201,90 @@ class SecurityBoundaryTests(TestCase):
         self.assertIn("message", response.data)
 
     @override_settings(
+        EMAIL_BACKEND="django.core.mail.backends.locmem.EmailBackend",
+        EMAIL_HOST_USER="noreply@example.invalid",
+    )
+    def test_password_reset_has_a_generic_response_and_revokes_refresh_tokens(self):
+        user = User.objects.create_user(
+            email="reset-revocation@example.invalid",
+            password="ExistingPass123!",
+        )
+        RefreshToken.for_user(user)
+        outstanding = OutstandingToken.objects.get(user=user)
+
+        known = self.client.post("/forgot-password/", {"email": user.email}, format="json")
+        unknown = self.client.post(
+            "/forgot-password/", {"email": "unknown@example.invalid"}, format="json"
+        )
+        self.assertEqual(known.status_code, unknown.status_code)
+        self.assertEqual(known.data, unknown.data)
+
+        uidb64 = urlsafe_base64_encode(force_bytes(user.pk))
+        token = default_token_generator.make_token(user)
+        reset = self.client.post(
+            f"/reset-password/{uidb64}/{token}/",
+            {"password": "NewStrongPass123!", "confirm_password": "NewStrongPass123!"},
+            format="json",
+        )
+        self.assertEqual(reset.status_code, 200, reset.data)
+        self.assertTrue(BlacklistedToken.objects.filter(token=outstanding).exists())
+
+    @patch("myapp.views.id_token.verify_oauth2_token")
+    def test_google_login_requires_verified_active_account(self, verify_token):
+        verify_token.return_value = {
+            "email": "unverified@example.invalid",
+            "email_verified": False,
+        }
+        self.assertEqual(
+            self.client.post("/google-login/", {"token": "token"}, format="json").status_code,
+            400,
+        )
+
+        disabled = User.objects.create_user(
+            email="disabled@example.invalid",
+            password="DisabledPass123!",
+            is_active=False,
+        )
+        verify_token.return_value = {
+            "email": disabled.email,
+            "email_verified": True,
+        }
+        self.assertEqual(
+            self.client.post("/google-login/", {"token": "token"}, format="json").status_code,
+            403,
+        )
+
+    @patch("payment.views.stripe.Refund.create")
+    def test_unfulfillable_paid_checkout_is_refunded_once(self, refund):
+        from payment.views import CheckoutFulfillmentError, refund_unfulfillable_checkout
+
+        user = User.objects.create_user(
+            email="refund@example.invalid", password="RefundPass123!"
+        )
+        address = Address.objects.create(user=user, full_name="Refund Customer")
+        session = SimpleNamespace(
+            id="cs_refund_once",
+            payment_intent="pi_refund_once",
+            amount_total=1234,
+            metadata={"user_id": str(user.id), "address_id": str(address.id)},
+        )
+
+        order = refund_unfulfillable_checkout(
+            session, CheckoutFulfillmentError("Insufficient stock")
+        )
+        replay = refund_unfulfillable_checkout(
+            session, CheckoutFulfillmentError("Insufficient stock")
+        )
+
+        self.assertEqual(order.id, replay.id)
+        self.assertEqual(order.payment_status, "Refunded")
+        self.assertEqual(order.status, "Cancelled")
+        refund.assert_called_once_with(
+            payment_intent="pi_refund_once",
+            idempotency_key="checkout-fulfillment-refund:cs_refund_once",
+        )
+
+    @override_settings(
         GLOBAL_RATE_LIMIT=1000,
         ADMIN_LOGIN_MAX_ATTEMPTS=2,
         ADMIN_LOGIN_WINDOW=900,
@@ -321,6 +412,173 @@ class SecurityBoundaryTests(TestCase):
         self.client.get("/products/")
         response = self.client.get("/products/")
         self.assertEqual(response.status_code, 429)
+
+
+@override_settings(SECURE_SSL_REDIRECT=False, JWT_COOKIE_SECURE=True)
+class CookieAuthenticationSecurityTests(TestCase):
+    def setUp(self):
+        cache.clear()
+        self.client = APIClient(enforce_csrf_checks=True)
+        self.user = User.objects.create_user(
+            email="cookie-user@example.invalid",
+            password="CookiePass123!",
+            role="Customer",
+        )
+
+    def _csrf_token(self):
+        response = self.client.get("/auth/csrf/")
+        self.assertEqual(response.status_code, 200)
+        return response.cookies[settings.CSRF_COOKIE_NAME].value
+
+    def test_http_is_redirected_to_https(self):
+        with override_settings(SECURE_SSL_REDIRECT=True):
+            response = APIClient().get("/health/", secure=False)
+        self.assertEqual(response.status_code, 301)
+        self.assertTrue(response["Location"].startswith("https://"))
+
+    def test_login_refresh_rotation_logout_and_session_use_secure_cookies(self):
+        csrf_token = self._csrf_token()
+        login_response = self.client.post(
+            "/login/",
+            {
+                "email": self.user.email,
+                "password": "CookiePass123!",
+                "login_type": "customer",
+            },
+            format="json",
+        )
+        self.assertEqual(login_response.status_code, 200, login_response.data)
+        self.assertNotIn("access", login_response.data)
+        self.assertNotIn("refresh", login_response.data)
+        for cookie_name in (settings.JWT_ACCESS_COOKIE_NAME, settings.JWT_REFRESH_COOKIE_NAME):
+            cookie = login_response.cookies[cookie_name]
+            self.assertTrue(cookie["httponly"])
+            self.assertTrue(cookie["secure"])
+            self.assertEqual(cookie["samesite"], "Lax")
+
+        session_response = self.client.get("/auth/session/")
+        self.assertEqual(session_response.status_code, 200)
+        self.assertEqual(session_response.data["user"]["id"], self.user.id)
+        self.assertEqual(session_response.data["user"]["permissions"], {"is_super_admin": False})
+
+        # Ambient refresh cookies cannot rotate without the CSRF header.
+        csrf_failed = self.client.post("/token/refresh/", {}, format="json")
+        self.assertEqual(csrf_failed.status_code, 403)
+
+        old_refresh = self.client.cookies[settings.JWT_REFRESH_COOKIE_NAME].value
+        old_jti = RefreshToken(old_refresh)["jti"]
+        rotated = self.client.post(
+            "/token/refresh/",
+            {},
+            format="json",
+            HTTP_X_CSRFTOKEN=csrf_token,
+        )
+        self.assertEqual(rotated.status_code, 200, rotated.data)
+        self.assertNotIn("access", rotated.data)
+        self.assertNotIn("refresh", rotated.data)
+        self.assertNotEqual(
+            old_refresh,
+            rotated.cookies[settings.JWT_REFRESH_COOKIE_NAME].value,
+        )
+        self.assertTrue(BlacklistedToken.objects.filter(token__jti=old_jti).exists())
+
+        logout = self.client.post(
+            "/logout/", {}, format="json", HTTP_X_CSRFTOKEN=csrf_token
+        )
+        self.assertEqual(logout.status_code, 200)
+        self.assertEqual(logout.cookies[settings.JWT_ACCESS_COOKIE_NAME]["max-age"], 0)
+        self.assertEqual(logout.cookies[settings.JWT_REFRESH_COOKIE_NAME]["max-age"], 0)
+        self.assertEqual(self.client.get("/auth/session/").status_code, 401)
+
+    @patch("myapp.views.id_token.verify_oauth2_token")
+    def test_google_login_uses_the_same_cookie_only_contract(self, verify_token):
+        verify_token.return_value = {
+            "email": self.user.email,
+            "email_verified": True,
+            "given_name": "Cookie",
+        }
+        response = self.client.post("/google-login/", {"token": "google-token"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertNotIn("access", response.data)
+        self.assertNotIn("refresh", response.data)
+        self.assertIn(settings.JWT_ACCESS_COOKIE_NAME, response.cookies)
+        self.assertIn(settings.JWT_REFRESH_COOKIE_NAME, response.cookies)
+
+    def test_django_admin_rejects_staff_member_without_super_admin_role(self):
+        staff_customer = User.objects.create_user(
+            email="staff-customer@example.invalid",
+            password="StaffCustomerPass123!",
+            role="Customer",
+            is_staff=True,
+        )
+        self.client.force_login(staff_customer)
+        denied = self.client.get("/admin/")
+        self.assertEqual(denied.status_code, 302)
+        self.assertIn("/admin/login/", denied["Location"])
+
+        super_admin = User.objects.create_superuser(
+            email="cookie-admin@example.invalid", password="AdminPass123!"
+        )
+        self.client.force_login(super_admin)
+        self.assertEqual(self.client.get("/admin/").status_code, 200)
+
+    def test_authenticated_customer_cannot_access_other_customer_objects(self):
+        other = User.objects.create_user(
+            email="other-owner@example.invalid", password="OtherPass123!"
+        )
+        address = Address.objects.create(user=other, full_name="Other owner")
+        order = Order.objects.create(user=other, total_amount=Decimal("1.00"))
+        self.client.force_authenticate(user=self.user)
+
+        self.assertEqual(self.client.get(f"/order-details/{order.id}/").status_code, 403)
+        self.assertEqual(self.client.delete(f"/addresses/{address.id}/").status_code, 403)
+        self.assertEqual(
+            self.client.post(
+                "/payment/create-checkout-session/", {"address": address.id}, format="json"
+            ).status_code,
+            403,
+        )
+
+    @patch("payment.views.stripe.Webhook.construct_event")
+    def test_duplicate_signed_webhook_is_idempotent(self, construct_event):
+        class StripeSession(dict):
+            @property
+            def payment_status(self):
+                return self["payment_status"]
+
+            @property
+            def metadata(self):
+                return self["metadata"]
+
+            @property
+            def id(self):
+                return self["id"]
+
+        session = StripeSession(
+            id="cs_duplicate_webhook",
+            payment_status="paid",
+            metadata={"user_id": str(self.user.id), "address_id": "1"},
+        )
+        Order.objects.create(
+            user=self.user,
+            stripe_session_id=session.id,
+            payment_status="Paid",
+            status="Processing",
+            total_amount=Decimal("1.00"),
+        )
+        construct_event.return_value = {
+            "type": "checkout.session.completed",
+            "data": {"object": session},
+        }
+        for _ in range(2):
+            response = self.client.post(
+                "/payment/stripe-webhook/",
+                b"{}",
+                content_type="application/json",
+                HTTP_STRIPE_SIGNATURE="test-signature",
+            )
+            self.assertEqual(response.status_code, 200)
+        self.assertEqual(Order.objects.filter(stripe_session_id=session.id).count(), 1)
 
 
 class CouponApplicationTests(TestCase):
@@ -757,7 +1015,7 @@ class CouponEnhancementTests(TestCase):
         cart_item = Cart.objects.get(user=self.customer)
         self.assertIsNone(cart_item.coupon_id)
 
-    def test_deactivated_coupon_is_not_used_when_order_is_created(self):
+    def test_direct_order_endpoint_is_disabled_and_preserves_stock(self):
         coupon = self.create_product_percentage_coupon("ORDERDEACT10")
         self.client.force_authenticate(user=self.customer)
         self.assertEqual(
@@ -791,11 +1049,12 @@ class CouponEnhancementTests(TestCase):
             {"address": address.id},
             format="json",
         )
-        self.assertEqual(response.status_code, 201, response.data)
-        order = Order.objects.get(pk=response.data["order_id"])
-        self.assertEqual(order.discount_amount, Decimal("0.00"))
-        self.assertEqual(order.total_amount, Decimal("2015.00"))
-        self.assertEqual(OrderItem.objects.get(order=order).price, Decimal("2000.00"))
+        self.assertEqual(response.status_code, 410, response.data)
+        self.assertEqual(Order.objects.count(), 0)
+        stock_before = self.shoe_variant.stock
+        self.shoe_variant.refresh_from_db()
+        self.assertEqual(self.shoe_variant.stock, stock_before)
+        self.assertTrue(Cart.objects.filter(user=self.customer).exists())
 
     @patch("payment.views.StripeService.create_checkout_session")
     def test_deactivated_coupon_is_removed_before_payment_session_totals(self, create_session):
@@ -826,7 +1085,7 @@ class CouponEnhancementTests(TestCase):
             city="Test City",
             postal_code="0000",
         )
-        create_session.return_value.url = "https://stripe.example/checkout"
+        create_session.return_value.url = "https://checkout.stripe.com/c/pay_test"
 
         response = self.client.post(
             "/payment/create-checkout-session/",
@@ -836,6 +1095,22 @@ class CouponEnhancementTests(TestCase):
         self.assertEqual(response.status_code, 200, response.data)
         product_line = create_session.call_args.kwargs["line_items"][0]
         self.assertEqual(product_line["price_data"]["unit_amount"], 200000)
+
+    @patch("payment.views.StripeService.create_checkout_session")
+    def test_checkout_rejects_non_stripe_or_non_https_redirect_urls(self, create_session):
+        self.client.force_authenticate(user=self.customer)
+        self.assertEqual(
+            self.client.post(
+                "/cart/add/", {"variant": self.shoe_variant.id, "quantity": 1}, format="json"
+            ).status_code,
+            200,
+        )
+        address = Address.objects.create(user=self.customer, full_name="Stripe URL Customer")
+        create_session.return_value.url = "http://checkout.stripe.com/c/not-secure"
+        response = self.client.post(
+            "/payment/create-checkout-session/", {"address": address.id}, format="json"
+        )
+        self.assertEqual(response.status_code, 502, response.data)
 
 
 class ProductWorkflowRegressionTests(TestCase):
@@ -1782,7 +2057,7 @@ class WelcomeBonusFlowTests(TestCase):
             {"code": self.assignment.code, "product_id": self.product.id},
             format="json",
         )
-        self.assertEqual(ownership.status_code, 400, ownership.data)
+        self.assertEqual(ownership.status_code, 403, ownership.data)
         self.assertEqual(ownership.data["error_code"], "WELCOME_BONUS_NOT_ASSIGNED_TO_USER")
 
         self.client.force_authenticate(user=self.customer)
@@ -1795,7 +2070,7 @@ class WelcomeBonusFlowTests(TestCase):
         self.assertEqual(ineligible.status_code, 400, ineligible.data)
         self.assertEqual(ineligible.data["error_code"], "WELCOME_BONUS_NOT_APPLICABLE")
 
-    def test_order_redeems_bonus_and_admin_deactivation_invalidates_cart(self):
+    def test_direct_order_endpoint_cannot_redeem_bonus_or_consume_stock(self):
         code = self.claim_and_copy()
         self.assertEqual(
             self.client.post(
@@ -1815,10 +2090,14 @@ class WelcomeBonusFlowTests(TestCase):
             postal_code="1010",
         )
         ordered = self.client.post("/place-order/", {"address": address.id}, format="json")
-        self.assertEqual(ordered.status_code, 201, ordered.data)
+        self.assertEqual(ordered.status_code, 410, ordered.data)
         self.assignment.refresh_from_db()
-        self.assertEqual(self.assignment.status, WelcomeBonusAssignment.STATUS_REDEEMED)
-        self.assertTrue(WelcomeBonusRedemption.objects.filter(assignment=self.assignment).exists())
+        self.assertEqual(self.assignment.status, WelcomeBonusAssignment.STATUS_CLAIMED)
+        self.assertFalse(WelcomeBonusRedemption.objects.filter(assignment=self.assignment).exists())
+
+        # The disabled endpoint must leave the original cart untouched; clear
+        # it before setting up the independent inactive-campaign scenario.
+        Cart.objects.filter(user=self.customer).delete()
 
         # A fresh assignment is detached from cart when the campaign is
         # deactivated, proving totals are revalidated server-side.

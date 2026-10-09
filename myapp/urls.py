@@ -4,6 +4,8 @@ from .views import ThrottledTokenRefreshView
 
 urlpatterns = [
     path("health/", views.health_check),
+    path("auth/csrf/", views.csrf_token, name="auth_csrf"),
+    path("auth/session/", views.auth_session, name="auth_session"),
     path("register/",views.register),
     path("token/refresh/", ThrottledTokenRefreshView.as_view(), name="token_refresh"),
     path("google-login/", views.google_login),
@@ -73,15 +75,6 @@ path(
     path(
         "home/categories/",views.home_categories,name="home-categories"
     ),
-    path(
-    "admin-order-details/<int:id>/",
-    views.admin_order_details
-),
-
-path(
-    "update-order-status/<int:id>/",
-    views.update_order_status
-),
 path(
     "wishlist-products/",
     views.wishlist_products

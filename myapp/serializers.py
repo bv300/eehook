@@ -97,14 +97,9 @@ class ForgotPasswordSerializer(serializers.Serializer):
     email = serializers.EmailField()
     def validate(self, data):
         data["email"] = data["email"].strip().lower()
-        try:
-            user = User.objects.get( email=data["email"])
-
-        except User.DoesNotExist:
-            raise serializers.ValidationError({
-                 "error": "No account found with this email address."
-                })
-        data["user"] = user
+        # The caller returns one generic message in both cases to prevent
+        # account enumeration.
+        data["user"] = User.objects.filter(email=data["email"]).first()
         return data
 
 class ResetPasswordSerializer( serializers.Serializer):
@@ -707,7 +702,6 @@ class ProfileSerializer(serializers.ModelSerializer):
             "date_of_birth",
             profile.date_of_birth
         )
-        print(profile.phone, profile.gender, profile.date_of_birth)
         profile.save()
         
 

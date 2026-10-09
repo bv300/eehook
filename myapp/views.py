@@ -27,6 +27,7 @@ from django.utils.http import (
 )
 from django.utils.encoding import force_bytes
 from django.utils import timezone
+from django.middleware.csrf import get_token
 
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
@@ -35,6 +36,10 @@ from rest_framework.pagination import PageNumberPagination
 from django.http import HttpResponse, JsonResponse
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenRefreshView
+from rest_framework_simplejwt.token_blacklist.models import (
+    BlacklistedToken,
+    OutstandingToken,
+)
 
 @api_view(["GET"])
 def health_check(request):
@@ -45,7 +50,7 @@ from .serializers import *
 from .models import *
 
 
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from .permissions import IsSuperAdmin
 
 from rest_framework.decorators import (
@@ -62,6 +67,8 @@ import csv
 import logging
 from google.auth.exceptions import GoogleAuthError
 from .utils import AuthRateThrottle, SearchRateThrottle
+from .auth_cookies import clear_auth_cookies, set_auth_cookies
+from .authentication import enforce_csrf
 from .welcome_bonus import (
     calculate_welcome_bonus_price,
     get_eligible_welcome_bonus_assignment,
@@ -118,6 +125,70 @@ def _paginate_public_products(request, products):
 class ThrottledTokenRefreshView(TokenRefreshView):
     throttle_classes = [AuthRateThrottle]
 
+    def post(self, request, *args, **kwargs):
+        """Rotate the refresh cookie without exposing tokens in JSON."""
+        refresh_token = request.data.get("refresh") or request.COOKIES.get(
+            settings.JWT_REFRESH_COOKIE_NAME
+        )
+        if not refresh_token:
+            return Response(
+                {"detail": "Refresh token is required."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        # A refresh cookie is ambient browser credentials, so require CSRF even
+        # when the access cookie has expired and DRF cannot authenticate it.
+        if request.COOKIES.get(settings.JWT_REFRESH_COOKIE_NAME):
+            enforce_csrf(request)
+
+        serializer = self.get_serializer(data={"refresh": refresh_token})
+        serializer.is_valid(raise_exception=True)
+        refreshed = serializer.validated_data
+        response = Response({"detail": "Token refreshed."}, status=status.HTTP_200_OK)
+        return set_auth_cookies(
+            response,
+            access_token=refreshed["access"],
+            refresh_token=refreshed.get("refresh", refresh_token),
+        )
+
+
+def _safe_session_user(user):
+    """Return only browser-safe, server-derived session information."""
+    is_super_admin = user.role == "Super Admin" and user.is_active
+    return {
+        "id": user.id,
+        "email": user.email,
+        "first_name": user.first_name,
+        "role": user.role,
+        "permissions": {"is_super_admin": is_super_admin},
+        "redirect_to": "/eehook-dashboard" if is_super_admin else "/",
+    }
+
+
+def _owned_object_or_error(model, object_id, user, *, label):
+    """Return an owned object, otherwise a precise 404/403 API response."""
+    obj = model.objects.filter(pk=object_id).first()
+    if obj is None:
+        return None, Response({"message": f"{label} not found"}, status=status.HTTP_404_NOT_FOUND)
+    if obj.user_id != user.id:
+        return None, Response({"detail": f"You do not have permission to access this {label.lower()}."}, status=status.HTTP_403_FORBIDDEN)
+    return obj, None
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def csrf_token(request):
+    """Set Django's non-secret CSRF cookie before credentialed mutations."""
+    return Response({"detail": "CSRF cookie set.", "csrfToken": get_token(request)})
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def auth_session(request):
+    """Return the current authenticated user without returning JWTs."""
+    get_token(request)
+    return Response({"user": _safe_session_user(request.user)})
+
 @api_view(["POST"])
 @throttle_classes([AuthRateThrottle])
 def google_login(request):
@@ -149,9 +220,9 @@ def google_login(request):
         email = info.get("email")
         first_name = info.get("given_name", "")
 
-        if not email:
+        if not email or str(info.get("email_verified", "")).lower() != "true":
             return Response(
-                {"error": "Google account email not found."},
+                {"error": "A verified Google account email is required."},
                 status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -167,6 +238,12 @@ def google_login(request):
             user.set_unusable_password()
             user.save()
 
+        if not user.is_active:
+            return Response(
+                {"detail": "This account is disabled."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
         if login_type == "customer" and (user.role != "Customer" or user.is_staff or user.is_superuser):
             return Response(
                 {"detail": "Admin accounts must use the Super Admin login page."},
@@ -180,23 +257,11 @@ def google_login(request):
 
         refresh = RefreshToken.for_user(user)
 
-        return Response(
-            {
-                "access": str(refresh.access_token),
-                "refresh": str(refresh),
-                "user": {
-                    "id": user.id,
-                    "email": user.email,
-                    "first_name": user.first_name,
-                    "is_staff": user.is_staff,
-                    "role": user.role,
-                    "redirect_to": (
-                        "/eehook-dashboard"
-                        if user.role == "Super Admin"
-                        else "/"
-                    ),
-                }
-            }
+        response = Response({"user": _safe_session_user(user)})
+        return set_auth_cookies(
+            response,
+            access_token=str(refresh.access_token),
+            refresh_token=str(refresh),
         )
 
     except GoogleAuthError:
@@ -264,45 +329,38 @@ def login(request):
 
     refresh = RefreshToken.for_user(user)
 
-    return Response(
-        {
-            "access": str(refresh.access_token),
-            "refresh": str(refresh),
-            "user": {
-                "id": user.id,
-                "email": user.email,
-                "first_name": user.first_name,
-                "is_staff": user.is_staff,
-                "role": user.role,
-                "redirect_to": (
-                        "/eehook-dashboard"
-                    if user.role == "Super Admin"
-                    else "/"
-                ),
-            },
-        "role": user.role,
-        "redirect_to": (
-            "/eehook-dashboard" if user.role == "Super Admin" else "/"
-        ),
-        },
-        status=status.HTTP_200_OK
+    response = Response(
+        {"user": _safe_session_user(user)},
+        status=status.HTTP_200_OK,
+    )
+    return set_auth_cookies(
+        response,
+        access_token=str(refresh.access_token),
+        refresh_token=str(refresh),
     )
 
 
 @api_view(["POST"])
-@permission_classes([IsAuthenticated])
+@permission_classes([AllowAny])
 def logout(request):
-    """Revoke the submitted refresh token when token blacklisting is enabled."""
-    refresh = request.data.get("refresh")
+    """Revoke a refresh token and expire both cookies in every case."""
+    refresh = request.data.get("refresh") or request.COOKIES.get(
+        settings.JWT_REFRESH_COOKIE_NAME
+    )
+    if request.COOKIES.get(settings.JWT_REFRESH_COOKIE_NAME):
+        enforce_csrf(request)
     if refresh:
         try:
             RefreshToken(refresh).blacklist()
         except Exception:
-            return Response({"message": "Invalid refresh token."}, status=400)
-    return Response(
+            # Token expiry/replay should not prevent browser logout or reveal
+            # token validity to an attacker.
+            pass
+    response = Response(
         {"message": "Logged out successfully."},
         status=status.HTTP_200_OK,
     )
+    return clear_auth_cookies(response)
 
 
 @api_view(["POST"])
@@ -314,46 +372,33 @@ def forgot_password(request):
     )
 
     if serializer.is_valid():
-
         user = serializer.validated_data["user"]
+        if user:
+            uidb64 = urlsafe_base64_encode(force_bytes(user.pk))
+            token = default_token_generator.make_token(user)
+            reset_link = f"{settings.SITE_URL}/reset-password/{uidb64}/{token}"
+            send_mail(
+                subject="Reset Your Password",
+                message=f"""
+                Hello {user.first_name},
 
-        uidb64 = urlsafe_base64_encode(
-            force_bytes(user.pk)
-        )
+                Click the link below to reset your password:
 
-        token = default_token_generator.make_token(
-            user
-        )
+                {reset_link}
 
-        reset_link = ( f"{settings.SITE_URL}/reset-password/{uidb64}/{token}")
+                Thank You,
+                Amora Team
+                """,
+                from_email=settings.EMAIL_HOST_USER,
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
 
-        send_mail(
-            subject="Reset Your Password",
-            message=f"""
-            Hello {user.first_name},
-
-            Click the link below to reset your password:
-
-            {reset_link}
-
-            Thank You,
-            Amora Team
-            """,
-            from_email=settings.EMAIL_HOST_USER,
-            recipient_list=[user.email],
-            fail_silently=False
-        )
-
-        return Response(
-            {
-                "message":
-                "Password reset email sent"
-            }
-        )
-
-    # Do not disclose whether an account exists.
+    # Keep the response and status identical whether an account exists or not.
     return Response({"message": "If the account exists, a reset email will be sent."}, status=200)
 @api_view(["POST"])
+@throttle_classes([AuthRateThrottle])
+@transaction.atomic
 def reset_password( request,uidb64,token):
 
     serializer = ResetPasswordSerializer( data=request.data )
@@ -374,9 +419,12 @@ def reset_password( request,uidb64,token):
             
             return Response({ "message": "Invalid Token" },status=400)
 
-        user.set_password( serializer.validated_data[ "password" ])
-
+        user.set_password(serializer.validated_data["password"])
         user.save()
+
+        # Password changes invalidate refresh tokens held by other devices.
+        for outstanding_token in OutstandingToken.objects.filter(user=user):
+            BlacklistedToken.objects.get_or_create(token=outstanding_token)
 
         return Response({ "message": "Password Reset Successful" } )
 
@@ -1033,11 +1081,9 @@ def get_wishlist(request):
 @api_view(["DELETE"])
 @permission_classes([IsAuthenticated])
 def remove_wishlist(request, id):
-
-    wishlist = Wishlist.objects.get(
-        id=id,
-        user=request.user
-    )
+    wishlist, error = _owned_object_or_error(Wishlist, id, request.user, label="Wishlist item")
+    if error:
+        return error
 
     wishlist.delete()
 
@@ -1553,25 +1599,10 @@ def get_cart(request):
 @api_view(["PATCH"])
 @permission_classes([IsAuthenticated])
 def update_cart_quantity(request, id):
-
-    try:
-
-        cart = Cart.objects.select_related(
-            "variant_unit"
-        ).get(
-            id=id,
-            user=request.user
-        )
-
-    except Cart.DoesNotExist:
-
-        return Response(
-            {
-                "message":
-                "Cart item not found"
-            },
-            status=status.HTTP_404_NOT_FOUND
-        )
+    cart, error = _owned_object_or_error(Cart, id, request.user, label="Cart item")
+    if error:
+        return error
+    cart = Cart.objects.select_related("variant_unit", "variant__product__offer").get(pk=cart.pk)
 
     current_source, current_promotion = _refresh_cart_promotion(cart)
 
@@ -1715,6 +1746,15 @@ from .whatsapp import send_owner_order_notification
 @permission_classes([IsAuthenticated])
 @transaction.atomic
 def place_order(request):
+
+    # Stripe is the only supported checkout path. The previous direct endpoint
+    # created unpaid orders and deducted stock, allowing stock exhaustion.
+    return Response(
+        {
+            "detail": "Direct order placement is disabled. Create a Stripe checkout session instead."
+        },
+        status=status.HTTP_410_GONE,
+    )
 
     address_id = request.data.get(
         "address"
@@ -1985,28 +2025,9 @@ def remove_cart_item(
     id
 ):
 
-    try:
-
-        cart = Cart.objects.get(
-
-            id=id,
-
-            user=request.user
-
-        )
-
-    except Cart.DoesNotExist:
-
-        return Response(
-
-            {
-                "message":
-                "Cart item not found"
-            },
-
-            status=404
-
-        )
+    cart, error = _owned_object_or_error(Cart, id, request.user, label="Cart item")
+    if error:
+        return error
 
     cart.delete()
 
@@ -2419,22 +2440,9 @@ def my_orders(request):
 @permission_classes([IsAuthenticated])
 @transaction.atomic
 def cancel_order(request, id):
-
-    try:
-
-        order = Order.objects.get(
-            id=id,
-            user=request.user
-        )
-
-    except Order.DoesNotExist:
-
-        return Response(
-            {
-                "message": "Order not found"
-            },
-            status=404
-        )
+    order, error = _owned_object_or_error(Order, id, request.user, label="Order")
+    if error:
+        return error
 
     if order.status not in [
         "Pending",
@@ -2479,23 +2487,9 @@ def cancel_order(request, id):
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def order_details(request, id):
-
-    try:
-
-        order = Order.objects.get(
-            id=id,
-            user=request.user
-        )
-
-    except Order.DoesNotExist:
-
-        return Response(
-            {
-                "message":
-                "Order not found"
-            },
-            status=404
-        )
+    order, error = _owned_object_or_error(Order, id, request.user, label="Order")
+    if error:
+        return error
 
     serializer = OrderSerializer(
         order
@@ -2676,7 +2670,7 @@ def admin_orders(request):
     
 @api_view(["GET"])
 @permission_classes([IsSuperAdmin])
-def admin_order_details(request, id):
+def legacy_admin_order_details(request, id):
 
     if not request.user.is_staff:
 
@@ -2930,7 +2924,6 @@ def profile(request):
     if request.method == "GET":
 
         serializer = ProfileSerializer(user)
-        print(serializer.data)
 
         return Response(serializer.data)
 
@@ -2983,14 +2976,9 @@ def address_list(request):
 @api_view(["PUT", "DELETE"])
 @permission_classes([IsAuthenticated])
 def address_detail(request, pk):
-
-    try:
-        address = Address.objects.get(id=pk, user=request.user)
-    except Address.DoesNotExist:
-        return Response(
-            {"message": "Address not found"},
-            status=status.HTTP_404_NOT_FOUND
-        )
+    address, error = _owned_object_or_error(Address, pk, request.user, label="Address")
+    if error:
+        return error
 
     if request.method == "PUT":
 
@@ -3062,7 +3050,8 @@ def admin_order_details(request, id):
         ).prefetch_related(
             "items__product",
             "items__color",
-            "items__size"
+            "items__unit",
+            "items__variant_unit",
         ).get(
             id=id
         )
@@ -3083,7 +3072,7 @@ def admin_order_details(request, id):
 
 @api_view(["PUT"])
 @permission_classes([IsSuperAdmin])
-def update_order_status(request, id):
+def legacy_update_order_status(request, id):
 
     if not request.user.is_staff:
 
@@ -3153,7 +3142,7 @@ def update_order_status(request, id):
 from django.db.models import Count
 
 @api_view(["GET"])
-@permission_classes([IsAuthenticated])
+@permission_classes([IsSuperAdmin])
 def wishlist_products(request):
 
     if not request.user.is_staff:
@@ -3516,7 +3505,11 @@ def validate_coupon(request):
                     "message": message,
                     "error_code": error_code,
                 },
-                status=status.HTTP_400_BAD_REQUEST,
+                status=(
+                    status.HTTP_403_FORBIDDEN
+                    if error_code == "WELCOME_BONUS_NOT_ASSIGNED_TO_USER"
+                    else status.HTTP_400_BAD_REQUEST
+                ),
             )
 
         # A claim is not a redemption. Applying a code merely records the
